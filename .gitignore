@@ -6,13 +6,10 @@ build_client/
 build_win_client/
 build_win_sdk/
 build_win/
-build_sdk/
 
 # Windows test binaries (scripts/build_tests_win.bat output)
-tests/bin_win/
 
 # Binary output
-bin/
 
 # CMake generated files
 CMakeFiles/
@@ -23,8 +20,6 @@ Makefile
 # Object files
 *.o
 *.obj
-*.a
-*.so
 *.dylib
 
 # IDE files
