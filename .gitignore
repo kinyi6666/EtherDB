@@ -1,0 +1,39 @@
+# Build directories
+build/
+build_base/
+build_net/
+build_client/
+build_win_client/
+build_win_sdk/
+build_win/
+build_sdk/
+
+# Windows test binaries (scripts/build_tests_win.bat output)
+tests/bin_win/
+
+# Binary output
+bin/
+
+# CMake generated files
+CMakeFiles/
+cmake_install.cmake
+CMakeCache.txt
+Makefile
+
+# Object files
+*.o
+*.obj
+*.a
+*.so
+*.dylib
+
+# IDE files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db

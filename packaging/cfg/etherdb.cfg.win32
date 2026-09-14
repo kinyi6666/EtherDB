@@ -1,0 +1,68 @@
+# ============================================================================
+# EtherDB Server Configuration — Windows (VS2022) example
+# ============================================================================
+# Put this file next to etherdb_server.exe and name it  etherdb.cfg
+# (that is the default config path on Windows:  <exe dir>\etherdb.cfg ).
+#
+# If the [storage] dataDir / [log] logDir entries are absent (as below) the
+# server keeps its Windows defaults, which are relative to the executable:
+#     dataDir = <exe dir>\etherdb_data
+#     logDir  = <exe dir>\etherdb_log
+# i.e. logs and data are created in the same folder as the binary — handy for
+# a quick local verification. Command-line -c / -d still override everything.
+# ============================================================================
+
+# ----------------------------------------------------------------------------
+# [server] — Network and threading settings
+# ----------------------------------------------------------------------------
+[server]
+# Client-facing shell server port
+#shellPort = 7040
+
+# Inter-node communication port (for multi-machine cluster)
+#peerPort = 7042
+
+# Number of CPU cores to use
+numCores = 4
+
+# Number of worker threads per core
+threadsPerCore = 1
+
+# Ratio of query threads to total threads (0.0 ~ 1.0)
+queryCoreRatio = 0.5
+
+# Maximum number of concurrent client connections
+maxShellConns = 5000
+
+# Connection idle timeout (seconds)
+shellIdleTime = 3600
+
+# ----------------------------------------------------------------------------
+# [monitor] — HTTP monitoring endpoint (Prometheus / Grafana)
+# ----------------------------------------------------------------------------
+[monitor]
+# Enable the HTTP monitor (0 = disabled)
+enabled = 1
+
+# HTTP port for /metrics, /api/v1/status, /api/v1/health, /api/v1/slowlog
+port = 9187
+
+# Queries slower than this (milliseconds) are counted as slow queries
+slowQueryMs = 100
+
+# ----------------------------------------------------------------------------
+# [storage] — Data storage settings
+# ----------------------------------------------------------------------------
+[storage]
+# Uncomment to store data in a specific absolute folder (default: exe dir):
+# dataDir = "D:\etherdb_data"
+
+# ----------------------------------------------------------------------------
+# [log] — Logging settings
+# ----------------------------------------------------------------------------
+[log]
+# Uncomment to write logs to a specific absolute folder (default: exe dir):
+# logDir = "D:\etherdb_log"
+
+# Minimum log level: trace, debug, info, warn, error
+logLevel = "info"
