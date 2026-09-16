@@ -5,18 +5,18 @@
 
 I've been building a time-series database from scratch in C++17 as a side project. No JVM, no third-party storage engine, no external database deps — the server is a single executable.
 
-Numbers first. Test machine is a **Phytium D2000** (8-core ARM aarch64 / 31 GB RAM / Kylin Linux). Better: **TDengine 2.1.7.2 is installed and running on the same box**, so this round finally has the same-machine, same-dataset, same-SQL comparison I owed from my last post:
+Numbers first. Test machine is a **Phytium D2000** (8-core ARM aarch64 / 31 GB RAM / Kylin Linux). This box already ran **TDengine 2.1.7.2**, and I've now added the **latest 3.4.2.8 (official Docker image, default settings)** — so this round has the same-machine, same-dataset, same-SQL comparison for **both generations**:
 
-| What | EtherDB | TDengine 2.1.7.2 (same box) |
-|---|---|---|
-| Batch insert, 10 cols, 10k rows/batch | **2.15M rows/s** avg, 2.34M peak | 0.83M rows/s avg |
-| SQL-text insert, 1k rows/batch | 0.54M rows/s avg | — (not tested) |
-| Streaming fetch, 10.02M rows | 11.3 s (~0.89M rows/s) | **2.1 s** (~4.7M rows/s) |
-| `LIMIT 10 OFFSET 500000` | **0.82 ms** (flat) | 133.41 ms (linear) |
-| `COUNT(*)` on 10M-row table | **0.34 ms** | 122.19 ms |
-| Integration test suite | **41/41 assertions pass** | — |
-| On-disk size, same 10.02M rows | **22 MB** | 39 MB |
-| Server RSS / binary | 233 MB (holding 61.2M rows) / **1.07 MB** | 314 MB / 2.79 MB (+10 MB client lib) |
+| What | EtherDB | **TDengine 3.4.2.8 (latest)** | TDengine 2.1.7.2 (reference) |
+|---|---|---|---|
+| Batch insert, 10 cols, 10k rows/batch | **2.15M rows/s** avg | **1.38M rows/s** avg | 0.83M rows/s avg |
+| SQL-text insert, 1k rows/batch | 0.54M rows/s avg | — (not tested) | — |
+| Streaming fetch, 10.02M rows | 11.3 s (~0.89M rows/s) | **~2.06 s** (~4.86M rows/s) | 2.1 s (~4.7M rows/s) |
+| `LIMIT 10 OFFSET 500000` | **0.82 ms** (flat) | 22.35 ms (grows with offset) | 133.41 ms (linear) |
+| `COUNT(*)` on 10M-row table | **0.34 ms** | 39.14 ms | 122.19 ms |
+| Integration test suite | **41/41 assertions pass** | — | — |
+| On-disk size, same 10.02M rows | **22 MB** | 12.1 MB data (WAL 497 MB, 1h retention) | 39 MB |
+| Server RSS / size | 233 MB (holding 61.2M rows) / **1.07 MB** | 422 MB (taosd) / 805 MB image + 105 MB client libs | 314 MB / 2.79 MB (+10 MB client lib) |
 
 A few design decisions behind those numbers:
 
@@ -30,8 +30,8 @@ A few design decisions behind those numbers:
 
 **Now the parts that aren't flattering:**
 
-- **I lose the full-fetch benchmark to TDengine by ~5x** (11.3 s vs 2.1 s for 10.02M rows). Main reason: client API semantics — `taos_fetch_row` hands you pointers into the client's block buffer (zero copy), while my `fetchRow` materializes every value into a typed object. A zero-copy block cursor is on my To-Do list.
-- **The TDengine here is v2.1.7.2** (a 2020 release running with default settings on this box) — the pagination/COUNT numbers especially do not represent TDengine 3.x.
+- **I lose the full-fetch benchmark to TDengine by ~5.5x** (11.3 s vs 2.06 s for 10.02M rows). Main reason: client API semantics — `taos_fetch_row` hands you pointers into the client's block buffer (zero copy), while my `fetchRow` materializes every value into a typed object. A zero-copy block cursor is on my To-Do list.
+- **I also tested the latest TDengine (3.4.2.8, default Docker settings) this time**: I win writes (~1.6x), pagination (~27x) and `COUNT(*)` (~115x); but 3.4's **full-scan filtering got 3–4x slower than 2.1.7.2** (759 vs 196 ms). Reporting it as-is, no cherry-picking. The 2.1.7.2 column stays as the generational reference.
 - Synthetic monotonic data, identical generator formulas on both sides — friendly to compression and aggregation in both engines.
 
 **Who it's for**: people who want to read the whole source, edge/embedded deployments, write-heavy single-node workloads with range/pagination/aggregate queries.
@@ -40,5 +40,4 @@ A few design decisions behind those numbers:
 BSL 1.1, converting to Apache 2.0 in 2030. All benchmark programs (including the TDengine comparison tool) live in `tests/`, so you can reproduce the numbers yourself.
 
 **Tear apart my index design if you want — verifiable criticism is more useful to me than praise.** Contact: kinyi6666@gmail.com
-
 ---
