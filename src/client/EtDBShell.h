@@ -809,13 +809,15 @@ inline uint8_t EtDBShell::lookupPrecision(const std::string& db) {
     std::string dbl = db;
     for (auto& c : dbl) c = (char)tolower((unsigned char)c);
     auto r = _client.query("SHOW DATABASES");
-    for (auto& row : r.rows()) {
-        if (row.size() < 5) continue;
-        std::string name = row[0].sVal;
+    for (int row = 0; row < r.rowCount(); ++row) {
+        if (r.colCount() < 5) continue;
+        // Zero-copy access to string columns (SHOW results are NCHAR columns)
+        std::string name(r.stringValue(row, 0));
         for (auto& c : name) c = (char)tolower((unsigned char)c);
         if (name == dbl) {
-            if (row[4].sVal == "ns") return 2;
-            if (row[4].sVal == "us") return 1;
+            std::string_view prec = r.stringValue(row, 4);
+            if (prec == "ns") return 2;
+            if (prec == "us") return 1;
             return 0;
         }
     }
@@ -1022,7 +1024,10 @@ inline bool EtDBShell::executeSQL(const std::string& sql) {
     if (result.colCount() == 0) {
         // Check if this was an INSERT with submit errors
         if (result.submitErrors() > 0) {
-            _formatter.printStatus(result.rows().empty() ? "OK" : result.rows()[0][0].toString());
+            // INSERT result status: single NCHAR string column (columnar storage, zero-copy access)
+            _formatter.printStatus(result.rowCount() == 0
+                                       ? std::string("OK")
+                                       : std::string(result.stringValue(0, 0)));
             printf("  Error details:\n");
             for (const auto& se : result.submitErrorEntries()) {
                 printf("    row[%d]: error code %d\n", se.rowIndex, se.errorCode);

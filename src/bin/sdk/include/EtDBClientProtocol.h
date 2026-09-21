@@ -274,7 +274,7 @@ struct SQueryRsp {
 
 // 流式元数据（查询响应 data[] 前缀）
 constexpr uint32_t ETDB_STREAM_MAGIC = 0x5354524D;  // "STRM"
-constexpr int64_t  ETDB_STREAM_BATCH_BYTES = 1024 * 1024 * 2;  // 每批字节预算
+constexpr int64_t  ETDB_STREAM_BATCH_BYTES = 1024 * 1024 * 2; // 每批字节预算
 
 struct SStreamMeta {
     uint32_t magic;     // ETDB_STREAM_MAGIC
@@ -420,27 +420,88 @@ struct STableMetaEntry {
 #pragma pack(pop)
 
 // ============================================================================
-// 值序列化
+// Value serialization (wire v2)
+//
+// In v1 every value carried a 4-byte length prefix, but the length only matters
+// for variable-length types (VAL_STRING); v2 drops the length field for
+// fixed-size types and splits integers by column type (short/int/bigint...).
+// Fixed-size payloads are all big-endian (network order); VAL_STRING is
+// tag + uint32 length + bytes.
+//
+//   VAL_NULL     = 0  [tag]                          1B
+//   VAL_INT      = 1  [tag][int32   BE]              5B   ← 8 bytes + 4-byte length in v1
+//   VAL_FLOAT    = 2  [tag][double  BE]              9B
+//   VAL_STRING   = 3  [tag][uint32 len BE][bytes]    5+n  ← the only variable-length type
+//   VAL_BOOL     = 4  [tag][uint8]                   2B
+//   VAL_UINT64   = 5  [tag][uint64  BE]              9B
+//   VAL_TINYINT  = 6  [tag][int8]                    2B   ← new
+//   VAL_SHORT    = 7  [tag][int16   BE]              3B   ← new: 2-byte short
+//   VAL_BIGINT   = 8  [tag][int64   BE]              9B   ← new: INT no longer carries 8 bytes
+//   VAL_UTINYINT = 9  [tag][uint8]                   2B   ← new
+//   VAL_USHORT   = 10 [tag][uint16  BE]              3B   ← new
+//   VAL_UINT32   = 11 [tag][uint32  BE]              5B   ← new
 // ============================================================================
-constexpr uint8_t VAL_NULL   = 0;
-constexpr uint8_t VAL_INT    = 1;
-constexpr uint8_t VAL_FLOAT  = 2;
-constexpr uint8_t VAL_STRING = 3;
-constexpr uint8_t VAL_BOOL   = 4;
-constexpr uint8_t VAL_UINT64 = 5;
+constexpr uint8_t VAL_NULL     = 0;
+constexpr uint8_t VAL_INT      = 1;
+constexpr uint8_t VAL_FLOAT    = 2;
+constexpr uint8_t VAL_STRING   = 3;
+constexpr uint8_t VAL_BOOL     = 4;
+constexpr uint8_t VAL_UINT64   = 5;
+constexpr uint8_t VAL_TINYINT  = 6;
+constexpr uint8_t VAL_SHORT    = 7;
+constexpr uint8_t VAL_BIGINT   = 8;
+constexpr uint8_t VAL_UTINYINT = 9;
+constexpr uint8_t VAL_USHORT   = 10;
+constexpr uint8_t VAL_UINT32   = 11;
 
+// ============================================================================
+// Query response payload layout
+//
+// The FIRST byte of SQueryRsp.data[] (right after the optional SStreamMeta
+// prefix) selects how the body is encoded. numCols/numRows/dataLen and the
+// streaming metadata keep the same meaning in both layouts.
+//
+//   ETDB_LAYOUT_TAG_ROWS  (0) — per-value tag encoding, see VAL_* above:
+//       per column: int16 nameLen(BE) + name + uint8 colType
+//       then numRows × numCols values, each [tag][payload]
+//
+//   ETDB_LAYOUT_RAW_BLOCK (1) — raw row-major block straight out of storage
+//   (zero processing server-side; the client keeps the block as-is):
+//       int32 rowStride (BE)                      // bytes per row
+//       per column (numCols):
+//           int16 nameLen(BE) + name bytes
+//           uint8 colType                         // ColType
+//           int32 slotBytes (BE)                  // fixed slot width of the column
+//           int32 rowOff    (BE)                  // in-row byte offset of the column
+//       numRows × rowStride bytes                 // host byte order, fixed slots,
+//                                                 // NCHAR/BINARY zero-padded, no NULLs
+//
+// Raw blocks carry the storage-native representation (host byte order, same ABI),
+// so they are only produced for plain-column projections on the same-endian
+// deployment; everything else uses ETDB_LAYOUT_TAG_ROWS.
+// ============================================================================
+constexpr uint8_t ETDB_LAYOUT_TAG_ROWS  = 0;
+constexpr uint8_t ETDB_LAYOUT_RAW_BLOCK = 1;
+
+// Deserialize a single value (wire v2; network order → host order).
+// Returns bytes consumed; <0 = invalid tag (the caller must abort parsing).
 inline int etdbDeserializeValue(const char* buf, Query::Value& v) {
-    uint8_t tp = (uint8_t)*buf++;
-    int32_t vl; memcpy(&vl, buf, 4); vl = ntohl(vl); buf += 4;
+    uint8_t tp = (uint8_t)buf[0];
     switch (tp) {
-        case VAL_INT:    { int64_t x; memcpy(&x, buf, 8); v = Query::Value((int64_t)be64toh(x)); break; }
-        case VAL_UINT64: { uint64_t x; memcpy(&x, buf, 8); v = Query::Value::fromUInt64((uint64_t)be64toh(x)); break; }
-        case VAL_FLOAT:  { uint64_t x; memcpy(&x, buf, 8); x = be64toh(x); double d; memcpy(&d, &x, 8); v = Query::Value(d); break; }
-        case VAL_STRING: v = Query::Value(std::string(buf, (size_t)vl)); break;
-        case VAL_BOOL:   v = Query::Value(buf[0] != 0); break;
-        default:         v = Query::Value(); break;
+        case VAL_NULL:     v = Query::Value(); return 1;
+        case VAL_BOOL:     v = Query::Value(buf[1] != 0); return 2;
+        case VAL_TINYINT:  v = Query::Value((int64_t)(int8_t)buf[1]); return 2;
+        case VAL_UTINYINT: v = Query::Value((int64_t)(uint8_t)buf[1]); return 2;
+        case VAL_SHORT:    { uint16_t x; memcpy(&x, buf + 1, 2); v = Query::Value((int64_t)(int16_t)ntohs(x)); return 3; }
+        case VAL_USHORT:   { uint16_t x; memcpy(&x, buf + 1, 2); v = Query::Value((int64_t)(uint16_t)ntohs(x)); return 3; }
+        case VAL_INT:      { uint32_t x; memcpy(&x, buf + 1, 4); v = Query::Value((int64_t)(int32_t)ntohl(x)); return 5; }
+        case VAL_UINT32:   { uint32_t x; memcpy(&x, buf + 1, 4); v = Query::Value((int64_t)(uint32_t)ntohl(x)); return 5; }
+        case VAL_BIGINT:   { uint64_t x; memcpy(&x, buf + 1, 8); v = Query::Value((int64_t)be64toh(x)); return 9; }
+        case VAL_UINT64:   { uint64_t x; memcpy(&x, buf + 1, 8); v = Query::Value::fromUInt64((uint64_t)be64toh(x)); return 9; }
+        case VAL_FLOAT:    { uint64_t x; memcpy(&x, buf + 1, 8); x = be64toh(x); double d; memcpy(&d, &x, 8); v = Query::Value(d); return 9; }
+        case VAL_STRING:   { uint32_t l; memcpy(&l, buf + 1, 4); l = ntohl(l); v = Query::Value(std::string(buf + 5, (size_t)l)); return 5 + (int)l; }
+        default:           return -1;
     }
-    return 5 + vl;
 }
 
 // ============================================================================

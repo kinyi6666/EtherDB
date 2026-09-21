@@ -33,6 +33,7 @@
 #define ETHERDB_CLIENT_H
 
 #include <string>
+#include <string_view>
 #include <vector>
 #include <memory>
 #include <unordered_map>
@@ -56,9 +57,61 @@ using Query::Value;
 class EtDBConnection;  // forward decl for streaming fetch
 
 // ============================================================================
-// EtDBResult — Query result wrapper
-// Supports TDengine-style streaming: fetchRow() pulls rows one-by-one,
-// automatically issuing FETCH to the server when the current batch is drained.
+// Column-storage cell types (matches EtDBResult::_colMeta[].rep)
+// ============================================================================
+enum ColumnRep : uint8_t {
+    COL_REP_NONE   = 0,
+    COL_REP_INT    = 1,   // signed integer (1/2/4/8 bytes, host order)
+    COL_REP_UINT   = 2,   // unsigned integer (1/2/4/8 bytes, host order)
+    COL_REP_FLOAT  = 3,   // floating point (4=float / 8=double)
+    COL_REP_BOOL   = 4,   // 1 byte (0/1)
+    COL_REP_STRING = 5,   // variable length: byte pool + offset table (see _columnOffsets)
+};
+
+namespace detail {
+// Types supported by column<T>() → column storage shape (unknown T returns nullptr)
+template <typename T> struct ColTypeTraits {
+    static constexpr uint8_t rep   = COL_REP_NONE;
+    static constexpr uint8_t width = 0;
+};
+template <> struct ColTypeTraits<int8_t>   { static constexpr uint8_t rep = COL_REP_INT;   static constexpr uint8_t width = 1; };
+template <> struct ColTypeTraits<uint8_t>  { static constexpr uint8_t rep = COL_REP_UINT;  static constexpr uint8_t width = 1; };
+template <> struct ColTypeTraits<int16_t>  { static constexpr uint8_t rep = COL_REP_INT;   static constexpr uint8_t width = 2; };
+template <> struct ColTypeTraits<uint16_t> { static constexpr uint8_t rep = COL_REP_UINT;  static constexpr uint8_t width = 2; };
+template <> struct ColTypeTraits<int32_t>  { static constexpr uint8_t rep = COL_REP_INT;   static constexpr uint8_t width = 4; };
+template <> struct ColTypeTraits<uint32_t> { static constexpr uint8_t rep = COL_REP_UINT;  static constexpr uint8_t width = 4; };
+template <> struct ColTypeTraits<int64_t>  { static constexpr uint8_t rep = COL_REP_INT;   static constexpr uint8_t width = 8; };
+template <> struct ColTypeTraits<uint64_t> { static constexpr uint8_t rep = COL_REP_UINT;  static constexpr uint8_t width = 8; };
+template <> struct ColTypeTraits<float>    { static constexpr uint8_t rep = COL_REP_FLOAT; static constexpr uint8_t width = 4; };
+template <> struct ColTypeTraits<double>   { static constexpr uint8_t rep = COL_REP_FLOAT; static constexpr uint8_t width = 8; };
+template <> struct ColTypeTraits<bool>     { static constexpr uint8_t rep = COL_REP_BOOL;  static constexpr uint8_t width = 1; };
+} // namespace detail
+
+// ============================================================================
+// EtDBResult — Query result wrapper (wire v2 columnar storage + zero-copy cursor)
+//
+// Results are stored per column (no per-row Value array any more):
+//   _columnData[c]    — contiguous bytes of column c. Fixed-size columns = value
+//                       array in host byte order; variable-length columns =
+//                       byte pool (UTF-8 / binary payload).
+//   _columnOffsets[c] — variable-length columns only: rowCount()+1 prefix offsets
+//                       (relative to that column's byte pool).
+//   _colMeta[c].nullBits — NULL bitmap (1 bit per row, 1=NULL).
+//
+// Fetching matches TDengine: the library never parses values.
+//   · Column-wise: column<T>(col) returns the head pointer of the whole column
+//     array (nullptr when T does not match the column's storage shape/width);
+//     the caller just casts. String columns use columnStringData/Offsets or
+//     stringValue(); NULL via isNull()/nullBitmap().
+//   · Row-wise: fetchRow(const void**) returns raw pointers of the next row's
+//     cells (zero-copy, no Value construction) — a row-count-only benchmark has
+//     zero parse overhead; callers cast, or use column<T>() when parsing.
+//   Compat interfaces get()/fetchRow(vector<Value>&) construct Values on demand
+//   and are NOT on the zero-copy path.
+//
+// TDengine-style streaming is preserved: fetchRow() pulls row by row and issues
+// the next server FETCH automatically when a batch is exhausted (fetchBlock()
+// fetches whole blocks).
 // ============================================================================
 class EtDBResult {
 public:
@@ -69,10 +122,37 @@ public:
     int colCount() const;
     int rowCount() const;
     const std::vector<std::string>& columnNames() const;
-    const std::vector<ColType>& columnTypes() const;   // per-column type (if available)
-    const std::vector<std::vector<Value>>& rows() const;
+    const std::vector<ColType>& columnTypes() const;   // per-column type (wire)
 
-    // Access by position
+    // true when the current batch is a RAW BLOCK (wire layout 1): the rows are
+    // the storage image verbatim (host byte order, fixed slots, zero padded
+    // strings, no NULLs). The library keeps the block as-is — row pointers go
+    // straight into it — and the columnar accessors materialize their column on
+    // first use (cached until the next batch).
+    bool isRawBlock() const { return _rawMode; }
+
+    // ── Columnar zero-copy access (primary interface) ──
+    // Head pointer of the column array; nullptr when the column is absent or T
+    // does not match the column storage (shape/width).
+    // E.g. INT column → column<int32_t>(); SMALLINT → column<int16_t>();
+    //      BIGINT/TIMESTAMP → column<int64_t>(); UINT → column<uint32_t>();
+    //      FLOAT → column<float>(); DOUBLE → column<double>(); BOOL → column<bool>().
+    // Note: elements are in host byte order; NULL rows carry no valid value —
+    // test with isNull() first.
+    template <typename T> const T* column(int col) const;
+
+    // Variable-length columns (NCHAR/BINARY): byte-pool base + rowCount()+1 prefix offsets.
+    const char*     columnStringData(int col) const;
+    const uint32_t* columnStringOffsets(int col) const;
+    // Convenience access: zero-copy view [offsets[r], offsets[r+1]); NULL yields an empty view.
+    std::string_view stringValue(int row, int col) const;
+
+    // NULL check (bitmap); out-of-range returns true (consistent with get() returning NULL).
+    bool isNull(int row, int col) const;
+    // NULL-bitmap head pointer (ceil(rowCount/8) bytes; bit=1 marks the row NULL)
+    const uint8_t* nullBitmap(int col) const;
+
+    // Access by position (compat interface: constructs a Value on demand; not zero-copy)
     Value get(int row, int col) const;
 
     // Print formatted table
@@ -105,7 +185,25 @@ public:
     bool    streamEnded() const;
     bool    streamError() const;   // a FETCH round trip failed (network/error)
 
-    // Fetch the next row into `out`. Returns false when exhausted.
+    // ── Row-wise fetch (TAOS_ROW style) ──
+    // Zero-copy next row: writes each column's raw-value pointer into
+    // cols[0..colCount()-1]; the library does no parsing at all (zero parse
+    // overhead for a row-count-only benchmark):
+    //   · fixed-size column → points at this row's value in column storage
+    //     (host order; caller casts per column type, width = column type width:
+    //      INT → int32_t, SMALLINT → int16_t ...)
+    //   · string column → points at the payload in the byte pool
+    //     (length via valueLength(col))
+    //   · NULL cell → nullptr
+    // Pointers stay valid until the next fetchRow()/fetchBlock()/deserialize().
+    // Returns false when exhausted (streamError() == true means a FETCH failed).
+    bool fetchRow(const void** cols);
+
+    // Variable-length length of column col in the current row (the row obtained
+    // by the most recent fetchRow); 0 for non-string columns / no current row / NULL.
+    uint32_t valueLength(int col) const;
+
+    // Compat interface: builds std::vector<Value> (per-value construction; not zero-copy)
     bool fetchRow(std::vector<Value>& out);
 
     // Fetch the next BATCH of rows (TDengine taos_fetch_block style). Returns
@@ -125,10 +223,50 @@ public:
     void setStreamConn(EtDBConnection* conn);
 
 private:
+    // Column storage metadata: shape + fixed width + NULL bitmap
+    struct ColumnMeta {
+        uint8_t rep   = COL_REP_NONE;
+        uint8_t width = 0;                 // bytes per value for fixed-size columns (0 for variable-length)
+        std::vector<uint8_t> nullBits;     // bitmap: 1 bit per row, 1=NULL
+    };
+
+    // Set up the column-storage skeleton (per wire column type); buffers are reused across batches.
+    void setupColumns(int numCols, int numRows);
+    // Parse one wire value into (col,row); returns bytes consumed, <0 = corrupt stream / type mismatch.
+    int  storeValue(int col, int row, const char* p, const char* end);
+    // Clear the previous batch (buffer capacity is kept for reuse by streaming FETCH).
+    void resetStorage();    // Advance the row cursor: rows left in batch → true; exhausted → triggers FETCH; ended/failed → false.
+    bool advanceRow();
+    // Raw pointer of cell (row,col) (NULL → nullptr; string → payload in the byte pool).
+    const void* cellPtr(int row, int col) const;
+    // Common implementation of column<T>(): matches storage shape/width and returns the column data pointer.
+    const void* columnRaw(int col, uint8_t rep, uint8_t width) const;
+
+    // ── Raw-block (wire layout 1) ──
+    // Decode one raw slot into a Value (host byte order; strings zero-trimmed).
+    Value rawSlotValue(int row, int col) const;
+    // Trimmed payload length of a raw string slot (0 for non-string columns).
+    uint32_t rawSlotLength(int row, int col) const;
+    // Build the columnar view of a raw column on demand (byte pool + offsets for
+    // strings, strided copy for fixed-size columns); cached until the next batch.
+    bool materializeRawCol(int col) const;
+
     std::vector<std::string> _columnNames;
-    std::vector<ColType> _columnTypes;   // parsed from wire (may be empty)
-    std::vector<std::vector<Value>> _rows;
+    std::vector<ColType>     _columnTypes;   // wire column types (server-resolved from actual values)
+    mutable std::vector<std::vector<uint8_t>>  _columnData;     // [col] contiguous column bytes (lazy in raw mode)
+    mutable std::vector<std::vector<uint32_t>> _columnOffsets;  // [col] variable-length offsets (empty otherwise)
+    std::vector<ColumnMeta>            _colMeta;        // [col]
+    int _rowCount = 0;
     std::string _error;
+
+    // Raw-block storage: block = _rowCount rows of _rawStride bytes (row-major,
+    // host order). _rawRowOff/_rawSlotBytes come from the wire column descriptors.
+    std::vector<uint8_t>  _rawBlock;
+    std::vector<int32_t>  _rawRowOff;
+    std::vector<int32_t>  _rawSlotBytes;
+    mutable std::vector<uint8_t> _rawMat;   // [col] columnar materialization done?
+    int32_t _rawStride = 0;
+    bool    _rawMode   = false;
 
     // Streaming state (TDengine-style fetch)
     EtDBConnection* _conn = nullptr;
@@ -145,6 +283,13 @@ private:
     int _submitErrors    = 0;
     std::vector<SubmitErrorInfo> _submitErrorEntries;
 };
+
+// column<T>(): zero-copy head pointer of the column array (nullptr if T mismatches storage shape/width)
+template <typename T>
+const T* EtDBResult::column(int col) const {
+    return static_cast<const T*>(
+        columnRaw(col, detail::ColTypeTraits<T>::rep, detail::ColTypeTraits<T>::width));
+}
 
 // ============================================================================
 // EtDBConnection — Manages one TCP connection to etherdb server

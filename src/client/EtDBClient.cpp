@@ -77,19 +77,428 @@ inline void qtimeReport() {
 } // namespace
 
 // ============================================================================
-// EtDBResult Implementation
+// EtDBResult Implementation — wire v2 columnar storage
+//
+// Deserialization is "read row-major, write column-major": each parsed value is
+// written straight into its column's contiguous buffer (byte swap happens here
+// exactly once), constructing no Query::Value; fetching uses zero-copy pointers
+// via column<T>()/stringValue(). Streaming FETCH reuses each column's buffer.
 // ============================================================================
 
+namespace {
+
+// Column type → storage shape/width. The server-side header type byte is already
+// resolved from "declared type × actual values" (expression columns get their
+// real encoding type too), so the client maps it directly:
+//   SMALLINT→2-byte short, INT→4-byte int, BIGINT/TIMESTAMP→8 bytes;
+//   unsigned at the same widths; FLOAT/DOUBLE→float/double; NCHAR/BINARY→variable string column.
+inline void colTypeStore(ColType t, uint8_t& rep, uint8_t& width) {
+    switch (t) {
+        case ColType::BOOL:      rep = COL_REP_BOOL;  width = 1; break;
+        case ColType::TINYINT:   rep = COL_REP_INT;   width = 1; break;
+        case ColType::UTINYINT:  rep = COL_REP_UINT;  width = 1; break;
+        case ColType::SMALLINT:  rep = COL_REP_INT;   width = 2; break;  // 2-byte short
+        case ColType::USMALLINT: rep = COL_REP_UINT;  width = 2; break;
+        case ColType::INT:       rep = COL_REP_INT;   width = 4; break;  // 4-byte int
+        case ColType::UINT:      rep = COL_REP_UINT;  width = 4; break;
+        case ColType::BIGINT:
+        case ColType::TIMESTAMP: rep = COL_REP_INT;   width = 8; break;
+        case ColType::UBIGINT:   rep = COL_REP_UINT;  width = 8; break;
+        case ColType::FLOAT:     rep = COL_REP_FLOAT; width = 4; break;
+        case ColType::DOUBLE:    rep = COL_REP_FLOAT; width = 8; break;
+        case ColType::NCHAR:
+        case ColType::BINARY:    rep = COL_REP_STRING; width = 0; break;
+        default:                 rep = COL_REP_INT;   width = 8; break;  // fallback for unknown types
+    }
+}
+
+// Fixed-slot writes (saturating, defensive; values never exceed the column range in normal streams)
+inline void putSigned(uint8_t* dst, int w, int64_t v) {
+    switch (w) {
+        case 1: { int8_t  x = (int8_t)(v < -128 ? -128 : (v > 127 ? 127 : v)); memcpy(dst, &x, 1); break; }
+        case 2: { int16_t x = (int16_t)(v < -32768 ? -32768 : (v > 32767 ? 32767 : v)); memcpy(dst, &x, 2); break; }
+        case 4: { int32_t x = (int32_t)(v < INT32_MIN ? INT32_MIN : (v > INT32_MAX ? INT32_MAX : v)); memcpy(dst, &x, 4); break; }
+        default:{ int64_t x = v; memcpy(dst, &x, 8); break; }
+    }
+}
+inline void putUnsigned(uint8_t* dst, int w, uint64_t v) {
+    switch (w) {
+        case 1: { uint8_t  x = (uint8_t)(v > 0xFFULL ? 0xFFULL : v); memcpy(dst, &x, 1); break; }
+        case 2: { uint16_t x = (uint16_t)(v > 0xFFFFULL ? 0xFFFFULL : v); memcpy(dst, &x, 2); break; }
+        case 4: { uint32_t x = (uint32_t)(v > 0xFFFFFFFFULL ? 0xFFFFFFFFULL : v); memcpy(dst, &x, 4); break; }
+        default:{ uint64_t x = v; memcpy(dst, &x, 8); break; }
+    }
+}
+inline void putFloat(uint8_t* dst, int w, double d) {
+    if (w == 4) { float f = (float)d; memcpy(dst, &f, 4); }
+    else        { memcpy(dst, &d, 8); }
+}
+
+// Fixed-slot reads (host byte order)
+inline int64_t getSigned(const uint8_t* p, int w) {
+    switch (w) {
+        case 1: { int8_t  x; memcpy(&x, p, 1); return x; }
+        case 2: { int16_t x; memcpy(&x, p, 2); return x; }
+        case 4: { int32_t x; memcpy(&x, p, 4); return x; }
+        default:{ int64_t x; memcpy(&x, p, 8); return x; }
+    }
+}
+inline uint64_t getUnsigned(const uint8_t* p, int w) {
+    switch (w) {
+        case 1: { uint8_t  x; memcpy(&x, p, 1); return x; }
+        case 2: { uint16_t x; memcpy(&x, p, 2); return x; }
+        case 4: { uint32_t x; memcpy(&x, p, 4); return x; }
+        default:{ uint64_t x; memcpy(&x, p, 8); return x; }
+    }
+}
+inline double getFloat(const uint8_t* p, int w) {
+    if (w == 4) { float f; memcpy(&f, p, 4); return (double)f; }
+    double d; memcpy(&d, p, 8); return d;
+}
+
+// Parsed result of one wire v2 value (byte order already converted to host; no Query::Value constructed)
+struct WireVal {
+    uint8_t     tag   = VAL_NULL;
+    bool        isNum = false;    // numeric / boolean value
+    bool        isU   = false;    // unsigned origin
+    bool        isF   = false;    // floating-point origin
+    int64_t     i     = 0;        // signed view (unsigned values truncated as needed)
+    uint64_t    u     = 0;        // unsigned view
+    double      d     = 0.0;      // floating-point view
+    const char* s     = nullptr;  // string payload
+    uint32_t    slen  = 0;
+};
+
+// Parse one value; returns bytes consumed, <0 = corrupt stream / unknown tag.
+inline int parseWireValue(const char* p, const char* end, WireVal& out) {
+    if (p >= end) return -1;
+    const uint8_t tag = (uint8_t)p[0];
+    out.tag = tag; out.isNum = false; out.isU = false; out.isF = false;
+    out.s = nullptr; out.slen = 0;
+    switch (tag) {
+        case VAL_NULL: return 1;
+        case VAL_BOOL:
+            if (end - p < 2) return -1;
+            out.isNum = true; out.i = (p[1] != 0) ? 1 : 0; out.u = (uint64_t)out.i;
+            return 2;
+        case VAL_TINYINT:
+            if (end - p < 2) return -1;
+            out.isNum = true; out.i = (int8_t)p[1]; out.u = (uint64_t)out.i;
+            return 2;
+        case VAL_UTINYINT:
+            if (end - p < 2) return -1;
+            out.isNum = true; out.isU = true; out.u = (uint8_t)p[1]; out.i = (int64_t)out.u;
+            return 2;
+        case VAL_SHORT: {
+            if (end - p < 3) return -1;
+            uint16_t x; memcpy(&x, p + 1, 2);
+            out.isNum = true; out.i = (int64_t)(int16_t)ntohs(x); out.u = (uint64_t)out.i;
+            return 3;
+        }
+        case VAL_USHORT: {
+            if (end - p < 3) return -1;
+            uint16_t x; memcpy(&x, p + 1, 2);
+            out.isNum = true; out.isU = true; out.u = (uint16_t)ntohs(x); out.i = (int64_t)out.u;
+            return 3;
+        }
+        case VAL_INT: {
+            if (end - p < 5) return -1;
+            uint32_t x; memcpy(&x, p + 1, 4);
+            out.isNum = true; out.i = (int64_t)(int32_t)ntohl(x); out.u = (uint64_t)out.i;
+            return 5;
+        }
+        case VAL_UINT32: {
+            if (end - p < 5) return -1;
+            uint32_t x; memcpy(&x, p + 1, 4);
+            out.isNum = true; out.isU = true; out.u = (uint32_t)ntohl(x); out.i = (int64_t)out.u;
+            return 5;
+        }
+        case VAL_BIGINT: {
+            if (end - p < 9) return -1;
+            uint64_t x; memcpy(&x, p + 1, 8);
+            out.isNum = true; out.i = (int64_t)be64toh(x);
+            out.u = (out.i < 0) ? 0 : (uint64_t)out.i;
+            return 9;
+        }
+        case VAL_UINT64: {
+            if (end - p < 9) return -1;
+            uint64_t x; memcpy(&x, p + 1, 8);
+            out.isNum = true; out.isU = true; out.u = be64toh(x);
+            out.i = (out.u > (uint64_t)INT64_MAX) ? INT64_MAX : (int64_t)out.u;
+            return 9;
+        }
+        case VAL_FLOAT: {
+            if (end - p < 9) return -1;
+            uint64_t x; memcpy(&x, p + 1, 8); x = be64toh(x);
+            memcpy(&out.d, &x, 8);
+            out.isNum = true; out.isF = true;
+            return 9;
+        }
+        case VAL_STRING: {
+            if (end - p < 5) return -1;
+            uint32_t l; memcpy(&l, p + 1, 4); l = ntohl(l);
+            if ((uint64_t)(end - p - 5) < l) return -1;
+            out.s = p + 5; out.slen = l;
+            return 5 + (int)l;
+        }
+        default: return -1;
+    }
+}
+
+} // namespace
+
+// ============================================================================
+// Raw-block accessors (wire layout 1)
+// ============================================================================
+// A raw block is the storage row image: _rawStride bytes per row, each column
+// at _rawRowOff[col] with _rawSlotBytes[col] bytes (host byte order, zero padded
+// strings, no NULLs). Nothing is parsed when the batch arrives; the accessors
+// below only compute addresses, and the columnar views are materialized lazily.
+
+uint32_t EtDBResult::rawSlotLength(int row, int col) const {
+    if (row < 0 || row >= _rowCount || col < 0 || col >= (int)_rawSlotBytes.size()) return 0;
+    const ColType ct = (ColType)(uint8_t)_columnTypes[(size_t)col];
+    if (ct != ColType::NCHAR && ct != ColType::BINARY) return 0;
+    const uint8_t* p = _rawBlock.data() + (int64_t)row * _rawStride + _rawRowOff[(size_t)col];
+    int32_t n = _rawSlotBytes[(size_t)col];
+    while (n > 0 && p[n - 1] == 0) n--;      // slots are zero padded
+    return (uint32_t)n;
+}
+
+Value EtDBResult::rawSlotValue(int row, int col) const {
+    if (row < 0 || row >= _rowCount || col < 0 || col >= (int)_rawSlotBytes.size()) return Value();
+    const uint8_t* p = _rawBlock.data() + (int64_t)row * _rawStride + _rawRowOff[(size_t)col];
+    switch ((ColType)(uint8_t)_columnTypes[(size_t)col]) {
+        case ColType::TIMESTAMP: { int64_t v; memcpy(&v, p, 8); return Value(v); }
+        case ColType::BIGINT:    { int64_t v; memcpy(&v, p, 8); return Value(v); }
+        case ColType::DOUBLE:    { double  v; memcpy(&v, p, 8); return Value(v); }
+        case ColType::INT:       { int32_t v; memcpy(&v, p, 4); return Value((int64_t)v); }
+        case ColType::FLOAT:     { float   v; memcpy(&v, p, 4); return Value((double)v); }
+        case ColType::SMALLINT:  { int16_t v; memcpy(&v, p, 2); return Value((int64_t)v); }
+        case ColType::TINYINT:   { int8_t  v; memcpy(&v, p, 1); return Value((int64_t)v); }
+        case ColType::BOOL:      { int8_t  v; memcpy(&v, p, 1); return Value(v != 0); }
+        case ColType::UTINYINT:  { uint8_t  v; memcpy(&v, p, 1); return Value((int64_t)v); }
+        case ColType::USMALLINT: { uint16_t v; memcpy(&v, p, 2); return Value((int64_t)v); }
+        case ColType::UINT:      { uint32_t v; memcpy(&v, p, 4); return Value((int64_t)v); }
+        case ColType::UBIGINT:   { uint64_t v; memcpy(&v, p, 8); return Value::fromUInt64(v); }
+        case ColType::BINARY:
+        case ColType::NCHAR:
+            return Value(std::string((const char*)p, (size_t)rawSlotLength(row, col)));
+        default: return Value();
+    }
+}
+
+bool EtDBResult::materializeRawCol(int col) const {
+    if (!_rawMode || col < 0 || col >= (int)_rawSlotBytes.size()) return false;
+    if ((size_t)col < _rawMat.size() && _rawMat[(size_t)col]) return true;
+    const ColumnMeta& m = _colMeta[(size_t)col];
+    const int32_t off  = _rawRowOff[(size_t)col];
+    const int32_t slot = _rawSlotBytes[(size_t)col];
+    if (m.rep == COL_REP_STRING) {
+        // Same shape as the tag path: byte pool + rowCount()+1 prefix offsets.
+        std::vector<uint8_t>&  pool = _columnData[(size_t)col];
+        std::vector<uint32_t>& offs = _columnOffsets[(size_t)col];
+        pool.clear();
+        offs.assign((size_t)_rowCount + 1, 0);
+        for (int r = 0; r < _rowCount; ++r) {
+            const uint8_t* p = _rawBlock.data() + (int64_t)r * _rawStride + off;
+            int32_t n = slot;
+            while (n > 0 && p[n - 1] == 0) n--;
+            pool.insert(pool.end(), p, p + n);
+            offs[(size_t)r + 1] = (uint32_t)pool.size();
+        }
+    } else if (m.rep != COL_REP_NONE) {
+        std::vector<uint8_t>& data = _columnData[(size_t)col];
+        data.resize((size_t)_rowCount * (size_t)m.width);
+        for (int r = 0; r < _rowCount; ++r)
+            memcpy(data.data() + (size_t)r * m.width,
+                   _rawBlock.data() + (int64_t)r * _rawStride + off, (size_t)m.width);
+        _columnOffsets[(size_t)col].clear();
+    } else {
+        return false;
+    }
+    if (_rawMat.size() < _rawSlotBytes.size()) _rawMat.resize(_rawSlotBytes.size(), 0);
+    _rawMat[(size_t)col] = 1;
+    return true;
+}
+
 int EtDBResult::colCount() const { return (int)_columnNames.size(); }
-int EtDBResult::rowCount() const { return (int)_rows.size(); }
+int EtDBResult::rowCount() const { return _rowCount; }
 const std::vector<std::string>& EtDBResult::columnNames() const { return _columnNames; }
 const std::vector<ColType>& EtDBResult::columnTypes() const { return _columnTypes; }
-const std::vector<std::vector<Value>>& EtDBResult::rows() const { return _rows; }
+
+// Clear the previous batch (column buffer capacity is kept for repeated streaming FETCH reuse)
+void EtDBResult::resetStorage() {
+    _columnNames.clear();
+    _columnTypes.clear();
+    _rowCount = 0;
+    for (auto& c : _columnData) c.clear();
+    for (auto& o : _columnOffsets) o.clear();
+    for (auto& m : _colMeta) { m.rep = COL_REP_NONE; m.width = 0; m.nullBits.clear(); }
+    _rawMode = false;
+    _rawStride = 0;
+    _rawBlock.clear();
+    _rawRowOff.clear();
+    _rawSlotBytes.clear();
+    _rawMat.clear();
+}
+
+// Set up/reset column storage per wire column type (fixed-size columns preallocate rowCount*width; variable-length columns clear the byte pool)
+void EtDBResult::setupColumns(int numCols, int numRows) {
+    _rowCount = numRows;
+    _columnData.resize((size_t)numCols);
+    _columnOffsets.resize((size_t)numCols);
+    _colMeta.resize((size_t)numCols);
+    const size_t nullBytes = ((size_t)numRows + 7) / 8;
+    for (int ci = 0; ci < numCols; ++ci) {
+        uint8_t rep = COL_REP_NONE, width = 0;
+        colTypeStore(_columnTypes[(size_t)ci], rep, width);
+        ColumnMeta& m = _colMeta[(size_t)ci];
+        m.rep   = rep;
+        m.width = width;
+        m.nullBits.assign(nullBytes, 0);
+        std::vector<uint8_t>& data  = _columnData[(size_t)ci];
+        std::vector<uint32_t>& offs = _columnOffsets[(size_t)ci];
+        if (rep == COL_REP_STRING) {
+            data.clear();                               // keep capacity
+            offs.assign((size_t)numRows + 1, 0);
+        } else {
+            data.resize((size_t)numRows * width);       // new bytes are zero-initialized
+            offs.clear();
+        }
+    }
+}
+
+// Parse one wire value into (col,row); returns bytes consumed, <0 = corrupt stream / type mismatch.
+int EtDBResult::storeValue(int col, int row, const char* p, const char* end) {
+    WireVal wv;
+    int adv = parseWireValue(p, end, wv);
+    if (adv < 0) return -1;
+
+    ColumnMeta& m = _colMeta[(size_t)col];
+    if (wv.tag == VAL_NULL) {
+        m.nullBits[(size_t)row >> 3] |= (uint8_t)(1u << (row & 7));
+        if (m.rep == COL_REP_STRING) {
+            _columnOffsets[(size_t)col][(size_t)row + 1] = _columnOffsets[(size_t)col][(size_t)row];
+        } else {
+            memset(_columnData[(size_t)col].data() + (size_t)row * m.width, 0, m.width);
+        }
+        return 1;
+    }
+
+    if (m.rep == COL_REP_STRING) {
+        if (wv.s == nullptr) return -1;   // numeric value into a string column → protocol violation
+        std::vector<uint8_t>& pool = _columnData[(size_t)col];
+        if ((uint64_t)pool.size() + wv.slen > 0xFFFFFFFFULL) return -1;  // offsets are uint32
+        pool.insert(pool.end(), (const uint8_t*)wv.s, (const uint8_t*)wv.s + wv.slen);
+        _columnOffsets[(size_t)col][(size_t)row + 1] = (uint32_t)pool.size();
+        return adv;
+    }
+    if (wv.s != nullptr) return -1;       // string into a fixed-size column → protocol violation
+
+    uint8_t* dst = _columnData[(size_t)col].data() + (size_t)row * m.width;
+    switch (m.rep) {
+        case COL_REP_INT:
+            putSigned(dst, m.width, wv.i);
+            break;
+        case COL_REP_UINT: {
+            uint64_t v = wv.isF ? ((wv.d <= 0.0) ? 0ULL : (uint64_t)wv.d)
+                     : wv.isU ? wv.u
+                     : ((wv.i <= 0) ? 0ULL : (uint64_t)wv.i);
+            putUnsigned(dst, m.width, v);
+            break;
+        }
+        case COL_REP_FLOAT: {
+            double d = wv.isF ? wv.d : (wv.isU ? (double)wv.u : (double)wv.i);
+            putFloat(dst, m.width, d);
+            break;
+        }
+        case COL_REP_BOOL:
+            dst[0] = (wv.isF ? (wv.d != 0.0) : (wv.isU ? (wv.u != 0) : (wv.i != 0))) ? 1 : 0;
+            break;
+        default:
+            return -1;   // unknown fixed-size shape (should not happen)
+    }
+    return adv;
+}
+
+const void* EtDBResult::columnRaw(int col, uint8_t rep, uint8_t width) const {
+    if (col < 0 || col >= (int)_colMeta.size()) return nullptr;
+    if (_rawMode && !materializeRawCol(col)) return nullptr;   // lazy columnar view
+    const ColumnMeta& m = _colMeta[(size_t)col];
+    if (m.rep != rep || m.width != width) return nullptr;
+    if (m.rep == COL_REP_STRING || m.rep == COL_REP_NONE) return nullptr;
+    const std::vector<uint8_t>& data = _columnData[(size_t)col];
+    return data.empty() ? nullptr : (const void*)data.data();
+}
+
+const char* EtDBResult::columnStringData(int col) const {
+    if (col < 0 || col >= (int)_colMeta.size()) return nullptr;
+    if (_colMeta[(size_t)col].rep != COL_REP_STRING) return nullptr;
+    if (_rawMode && !materializeRawCol(col)) return nullptr;
+    const std::vector<uint8_t>& data = _columnData[(size_t)col];
+    return data.empty() ? nullptr : (const char*)data.data();
+}
+
+const uint32_t* EtDBResult::columnStringOffsets(int col) const {
+    if (col < 0 || col >= (int)_colMeta.size()) return nullptr;
+    if (_colMeta[(size_t)col].rep != COL_REP_STRING) return nullptr;
+    if (_rawMode && !materializeRawCol(col)) return nullptr;
+    const std::vector<uint32_t>& offs = _columnOffsets[(size_t)col];
+    return offs.empty() ? nullptr : offs.data();
+}
+
+std::string_view EtDBResult::stringValue(int row, int col) const {
+    if (row < 0 || row >= _rowCount) return std::string_view();
+    if (col < 0 || col >= (int)_colMeta.size()) return std::string_view();
+    if (_colMeta[(size_t)col].rep != COL_REP_STRING) return std::string_view();
+    if (isNull(row, col)) return std::string_view();
+    if (_rawMode) {
+        // Zero-copy view of the (zero-padded) slot with the padding trimmed.
+        const uint8_t* p = _rawBlock.data() + (int64_t)row * _rawStride + _rawRowOff[(size_t)col];
+        return std::string_view((const char*)p, (size_t)rawSlotLength(row, col));
+    }
+    const std::vector<uint32_t>& offs = _columnOffsets[(size_t)col];
+    if ((size_t)row + 1 >= offs.size()) return std::string_view();
+    const std::vector<uint8_t>& data = _columnData[(size_t)col];
+    return std::string_view((const char*)data.data() + offs[(size_t)row],
+                            (size_t)(offs[(size_t)row + 1] - offs[(size_t)row]));
+}
+
+bool EtDBResult::isNull(int row, int col) const {
+    if (row < 0 || row >= _rowCount || col < 0 || col >= (int)_colMeta.size()) return true;
+    const std::vector<uint8_t>& nb = _colMeta[(size_t)col].nullBits;
+    size_t byte = (size_t)row >> 3;
+    if (byte >= nb.size()) return true;
+    return ((nb[byte] >> (row & 7)) & 1u) != 0;
+}
+
+const uint8_t* EtDBResult::nullBitmap(int col) const {
+    if (col < 0 || col >= (int)_colMeta.size()) return nullptr;
+    const std::vector<uint8_t>& nb = _colMeta[(size_t)col].nullBits;
+    return nb.empty() ? nullptr : nb.data();
+}
 
 Value EtDBResult::get(int row, int col) const {
-    if (row >= 0 && row < (int)_rows.size() && col >= 0 && col < (int)_rows[row].size())
-        return _rows[row][col];
-    return Value();
+    if (row < 0 || row >= _rowCount || col < 0 || col >= (int)_colMeta.size()) return Value();
+    if (_rawMode) return rawSlotValue(row, col);
+    const ColumnMeta& m = _colMeta[(size_t)col];
+    if (isNull(row, col)) return Value();
+    if (m.rep == COL_REP_STRING) return Value(std::string(stringValue(row, col)));
+    const uint8_t* p = _columnData[(size_t)col].data() + (size_t)row * m.width;
+    switch (m.rep) {
+        case COL_REP_INT:   return Value(getSigned(p, m.width));
+        case COL_REP_UINT: {
+            uint64_t v = getUnsigned(p, m.width);
+            // Keep the legacy wire variant convention: unsigned values of ≤4 bytes
+            // are carried as the INT variant (old callers read .iVal); 8-byte ones
+            // as UINT64 (read .uVal).
+            return (m.width <= 4) ? Value((int64_t)v) : Value::fromUInt64(v);
+        }
+        case COL_REP_FLOAT: return Value(getFloat(p, m.width));
+        case COL_REP_BOOL:  return Value(p[0] != 0);
+        default:            return Value();
+    }
 }
 
 void EtDBResult::print() const {
@@ -106,15 +515,15 @@ void EtDBResult::print() const {
         printf("---");
     }
     printf("\n");
-    // Rows
-    for (const auto& row : _rows) {
-        for (size_t i = 0; i < row.size(); ++i) {
-            if (i) printf(" | ");
-            printf("%s", row[i].toString().c_str());
+    // Rows (the print path constructs Values on demand; not on the zero-copy hot path)
+    for (int r = 0; r < _rowCount; ++r) {
+        for (int ci = 0; ci < (int)_columnNames.size(); ++ci) {
+            if (ci) printf(" | ");
+            printf("%s", get(r, ci).toString().c_str());
         }
         printf("\n");
     }
-    printf("(%d rows)\n", (int)_rows.size());
+    printf("(%d rows)\n", _rowCount);
 }
 
 bool EtDBResult::deserialize(const uint8_t* buf, int bufLen) {
@@ -126,12 +535,13 @@ bool EtDBResult::deserialize(const uint8_t* buf, int bufLen) {
     int numRows = ntohl(rsp->numRows);
     int dataLen = ntohl(rsp->dataLen);
     if (numCols < 0 || numCols > 4096 || numRows < 0 || numRows > 1000000) return false;
+    if (dataLen < 0 || parseOff + (int)sizeof(SQueryRsp) + dataLen > bufLen) return false;
 
-    _columnNames.clear();
-    _columnTypes.clear();
-    _rows.clear();
+    resetStorage();
 
-    const char* d = rsp->data;
+    const char* d   = rsp->data;
+    const char* end = rsp->data + dataLen;
+
     // Detect streaming metadata prefix (TDengine-style fetch)
     _streamQId = 0; _streamTotalRows = 0; _streamEnded = true;
     if (dataLen >= (int)sizeof(SStreamMeta)) {
@@ -147,29 +557,86 @@ bool EtDBResult::deserialize(const uint8_t* buf, int bufLen) {
     }
     _rowCursor = 0;
 
-    // Parse column names (+ type byte, ColType value on the wire)
+    // ── Payload layout (1 byte, after the optional streaming metadata) ──
+    // Layout 1 = raw row block: the storage image verbatim. The client keeps the
+    // block as-is (a single memcpy) and serves pointers into it — nothing is
+    // parsed per value. Columnar accessors materialize on demand.
+    if (d >= end) return false;
+    const uint8_t layout = (uint8_t)*d++;
+    if (layout == ETDB_LAYOUT_RAW_BLOCK) {
+        if (end - d < 4) return false;
+        int32_t stride; memcpy(&stride, d, 4); stride = (int32_t)ntohl((uint32_t)stride); d += 4;
+        if (stride <= 0 || numCols <= 0 || numRows < 0) return false;
+        _rawStride = stride;
+        _rawRowOff.assign((size_t)numCols, 0);
+        _rawSlotBytes.assign((size_t)numCols, 0);
+        _columnNames.reserve((size_t)numCols);
+        _columnTypes.reserve((size_t)numCols);
+        for (int ci = 0; ci < numCols; ++ci) {
+            if (end - d < 2) return false;
+            uint16_t nameLen; memcpy(&nameLen, d, 2); nameLen = ntohs((uint16_t)nameLen); d += 2;
+            if (end - d < (int)nameLen + 1 + 8) return false;
+            _columnNames.emplace_back(d, nameLen);
+            d += nameLen;
+            _columnTypes.push_back((ColType)(uint8_t)*d++);
+            int32_t sb; memcpy(&sb, d, 4); sb = (int32_t)ntohl((uint32_t)sb); d += 4;
+            int32_t ro; memcpy(&ro, d, 4); ro = (int32_t)ntohl((uint32_t)ro); d += 4;
+            _rawSlotBytes[(size_t)ci] = sb;
+            _rawRowOff[(size_t)ci]    = ro;
+        }
+        const int64_t need = (int64_t)stride * (int64_t)numRows;
+        if (end - d < need) { resetStorage(); return false; }
+        _rawBlock.assign(d, d + (size_t)need);      // ONE memcpy for the whole batch
+        _rowCount = numRows;
+        _colMeta.assign((size_t)numCols, ColumnMeta());
+        _columnData.assign((size_t)numCols, std::vector<uint8_t>());
+        _columnOffsets.assign((size_t)numCols, std::vector<uint32_t>());
+        _rawMat.assign((size_t)numCols, 0);
+        const size_t nullBytes = ((size_t)numRows + 7) / 8;
+        for (int ci = 0; ci < numCols; ++ci) {
+            uint8_t rep = COL_REP_NONE, width = 0;
+            colTypeStore((ColType)(uint8_t)_columnTypes[(size_t)ci], rep, width);
+            ColumnMeta& m = _colMeta[(size_t)ci];
+            m.rep = rep;
+            m.width = width;
+            m.nullBits.assign(nullBytes, 0);   // raw blocks have no NULLs
+        }
+        _rawMode = true;
+        return true;
+    }
+    if (layout != ETDB_LAYOUT_TAG_ROWS) { resetStorage(); return false; }
+
+    // Column names + type bytes. The type byte is the server's actual wire
+    // encoding type (schema type for plain column refs; server-resolved by value
+    // range for expression columns) and decides the column storage shape/width.
+    _columnNames.reserve((size_t)numCols);
+    _columnTypes.reserve((size_t)numCols);
     for (int ci = 0; ci < numCols; ++ci) {
-        int16_t nameLen;
-        memcpy(&nameLen, d, 2);
-        nameLen = ntohs(nameLen);
+        if (end - d < 2) return false;
+        uint16_t nameLen; memcpy(&nameLen, d, 2); nameLen = ntohs(nameLen);
         d += 2;
-        _columnNames.push_back(std::string(d, nameLen));
-        uint8_t typeByte = (uint8_t)d[nameLen];
-        _columnTypes.push_back((ColType)typeByte);
-        d += nameLen + 1;  // skip name + type byte
+        if (end - d < (int)nameLen + 1) return false;
+        _columnNames.emplace_back(d, nameLen);
+        _columnTypes.push_back((ColType)(uint8_t)d[nameLen]);
+        d += (int)nameLen + 1;
     }
 
-    // Parse rows — 预分配 + move，避免每行/每列反复扩容（大结果集性能关键）
-    _rows.reserve((size_t)numRows);
+    // Single-pass parse: the stream is row-major, but each value goes straight
+    // into its column's contiguous buffer (column-major storage) with no
+    // Query::Value constructed — for large result sets the dominant cost is just
+    // this one byte copy + byte-order conversion.
+    setupColumns(numCols, numRows);
     for (int ri = 0; ri < numRows; ++ri) {
-        std::vector<Value> row;
-        row.reserve((size_t)numCols);
         for (int ci = 0; ci < numCols; ++ci) {
-            Value v;
-            d += etdbDeserializeValue(d, v);
-            row.push_back(std::move(v));
+            int adv = storeValue(ci, ri, d, end);
+            if (adv < 0) {
+                _error = "malformed query response (col " + std::to_string(ci) +
+                         ", row " + std::to_string(ri) + ")";
+                resetStorage();
+                return false;
+            }
+            d += adv;
         }
-        _rows.push_back(std::move(row));
     }
     return true;
 }
@@ -183,10 +650,9 @@ bool EtDBResult::deserializeSubmitRsp(const uint8_t* buf, int bufLen) {
     int affected  = (int)ntohl(rsp->affectedRows);
     int errors    = (int)ntohl(rsp->errorRows);
 
-    // Represent as a single-column result: "status"
-    _columnNames.clear();
-    _rows.clear();
-    _columnNames.push_back("status");
+    resetStorage();
+    _streamQId = 0; _streamTotalRows = 0; _streamEnded = true;
+    _rowCursor = 0;
     _submitSubmitted = submitted;
     _submitAffected  = affected;
     _submitErrors    = errors;
@@ -203,17 +669,20 @@ bool EtDBResult::deserializeSubmitRsp(const uint8_t* buf, int bufLen) {
         }
     }
 
-    // Build display row
-    std::vector<Value> row;
-    char buf2[256];
+    // Represented as a single "status" string column (1 row), columnar storage: byte pool + offsets
+    char msg[256];
     if (errors == 0) {
-        snprintf(buf2, sizeof(buf2), "OK: %d row(s) inserted", affected);
+        snprintf(msg, sizeof(msg), "OK: %d row(s) inserted", affected);
     } else {
-        snprintf(buf2, sizeof(buf2), "%d inserted, %d failed (total %d submitted)",
+        snprintf(msg, sizeof(msg), "%d inserted, %d failed (total %d submitted)",
                  affected, errors, submitted);
     }
-    row.push_back(Value(std::string(buf2)));
-    _rows.push_back(std::move(row));
+    _columnNames.push_back("status");
+    _columnTypes.push_back(ColType::NCHAR);
+    setupColumns(1, 1);
+    size_t len = strlen(msg);
+    _columnData[0].assign((const uint8_t*)msg, (const uint8_t*)msg + len);
+    _columnOffsets[0][1] = (uint32_t)len;
     return true;
 }
 
@@ -240,14 +709,9 @@ void EtDBResult::setFetchBatchBytes(int64_t b) {
 
 void EtDBResult::setStreamConn(EtDBConnection* conn) { _conn = conn; }
 
-bool EtDBResult::fetchRow(std::vector<Value>& out) {
-    bool qon = qtimeEnabled();
-    int64_t ts = qon ? qnowUs() : 0;
-    if (_rowCursor < (int)_rows.size()) {
-        out = _rows[_rowCursor++];
-        if (qon) { g_qperf.rowCopyUs += qnowUs() - ts; g_qperf.rowsFetched++; }
-        return true;
-    }
+// Advance the row cursor: rows left in batch → true; exhausted → triggers FETCH; ended/failed → false
+bool EtDBResult::advanceRow() {
+    if (_rowCursor < _rowCount) return true;
     // Current batch drained — FETCH next batch if streaming & not ended.
     if (_streamEnded || _streamQId == 0 || !_conn) return false;
     if (!_conn->fetchStreamRows(_streamQId, (int)_fetchBatchBytes, *this)) {
@@ -256,12 +720,56 @@ bool EtDBResult::fetchRow(std::vector<Value>& out) {
         return false;
     }
     _rowCursor = 0;
-    if (_rowCursor < (int)_rows.size()) {
-        out = _rows[_rowCursor++];
-        if (qon) { g_qperf.rowCopyUs += qnowUs() - ts; g_qperf.rowsFetched++; }
-        return true;
+    return _rowCursor < _rowCount;
+}
+
+// Raw pointer of cell (row,col) (NULL → nullptr; string → payload in the byte pool)
+const void* EtDBResult::cellPtr(int row, int col) const {
+    if (_rawMode) {
+        // Pointers go straight into the raw block (no parse, no copy).
+        if (row < 0 || row >= _rowCount || col < 0 || col >= (int)_rawSlotBytes.size()) return nullptr;
+        return (const void*)(_rawBlock.data() + (int64_t)row * _rawStride + _rawRowOff[(size_t)col]);
     }
-    return false;
+    const ColumnMeta& m = _colMeta[(size_t)col];
+    if (isNull(row, col)) return nullptr;
+    if (m.rep == COL_REP_STRING)
+        return (const void*)(_columnData[(size_t)col].data() + _columnOffsets[(size_t)col][(size_t)row]);
+    return (const void*)(_columnData[(size_t)col].data() + (size_t)row * m.width);
+}
+
+// Zero-copy row interface: fills raw pointers only — constructs no Value and
+// performs no type conversion. A row-count-only benchmark has zero parse
+// overhead; parsing is done by the caller's casts or via column<T>().
+bool EtDBResult::fetchRow(const void** cols) {
+    if (!advanceRow()) return false;
+    const int n = (int)_colMeta.size();
+    for (int c = 0; c < n; ++c) cols[c] = cellPtr(_rowCursor, c);
+    ++_rowCursor;
+    return true;
+}
+
+uint32_t EtDBResult::valueLength(int col) const {
+    int row = _rowCursor - 1;   // row obtained by the most recent fetchRow
+    if (row < 0 || row >= _rowCount || col < 0 || col >= (int)_colMeta.size()) return 0;
+    if (_colMeta[(size_t)col].rep != COL_REP_STRING) return 0;
+    if (_rawMode) return rawSlotLength(row, col);
+    if (isNull(row, col)) return 0;
+    const std::vector<uint32_t>& offs = _columnOffsets[(size_t)col];
+    if ((size_t)row + 1 >= offs.size()) return 0;
+    return offs[(size_t)row + 1] - offs[(size_t)row];
+}
+
+// Compat interface: builds Value rows from columnar storage on demand (not zero-copy, not on the hot path)
+bool EtDBResult::fetchRow(std::vector<Value>& out) {
+    if (!advanceRow()) return false;
+    bool qon = qtimeEnabled();
+    int64_t ts = qon ? qnowUs() : 0;
+    out.clear();
+    out.reserve(_colMeta.size());
+    for (int ci = 0; ci < (int)_colMeta.size(); ++ci) out.push_back(get(_rowCursor, ci));
+    ++_rowCursor;
+    if (qon) { g_qperf.rowCopyUs += qnowUs() - ts; g_qperf.rowsFetched++; }
+    return true;
 }
 
 int EtDBResult::fetchBlock() {
@@ -269,10 +777,11 @@ int EtDBResult::fetchBlock() {
     // usage), serve the remainder as this block first — they were already
     // pulled from the server, no extra FETCH round trip needed. The block is
     // CONSUMED: _rowCursor advances past it. Callers use rowCursor()-n to find
-    // the block's start within _rows (rows remain accessible via get()).
-    if (_rowCursor < (int)_rows.size()) {
-        int n = (int)_rows.size() - _rowCursor;
-        _rowCursor = (int)_rows.size();
+    // the block's start within the current batch (rows remain accessible via
+    // get()/column<T>() until the next FETCH replaces them).
+    if (_rowCursor < _rowCount) {
+        int n = _rowCount - _rowCursor;
+        _rowCursor = _rowCount;
         return n;
     }
     // Batch drained — FETCH the next batch if streaming & not ended.
@@ -282,8 +791,8 @@ int EtDBResult::fetchBlock() {
         _streamError = true;
         return -1;
     }
-    _rowCursor = (int)_rows.size();  // consume the whole new batch
-    return (int)_rows.size();
+    _rowCursor = _rowCount;  // consume the whole new batch
+    return _rowCount;
 }
 
 int EtDBResult::rowCursor() const { return _rowCursor; }
