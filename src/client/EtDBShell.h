@@ -38,6 +38,8 @@
 #include <string>
 #include <vector>
 #include <memory>
+#include <ctime>
+#include <cstring>
 #include <functional>
 #include <sstream>
 #include <iomanip>
@@ -305,8 +307,21 @@ private:
     void showHelp();
 
     // Look up the timestamp precision of a database (0=ms, 1=us, 2=ns)
-    // via SHOW DATABASES. Falls back to ms (0) on any failure.
+    // via SHOW DATABASES (answered from _precCache when already known).
+    // Falls back to ms (0) on any failure.
     uint8_t lookupPrecision(const std::string& db);
+
+    // ts display precision for THIS statement: derived from the queried table's
+    // database ("FROM db.table" / "FROM table" + current db), NOT from the
+    // session's current db — a cross-db query used to render ms data as 1970-.
+    uint8_t precisionForStatement(const std::string& sql);
+
+    // Shell-only convenience for INSERT: rewrite datetime literals into the raw
+    // integers the protocol expects (the SDK/API stays numeric-only):
+    //     timestamp '2026-06-02 00:00:01.001'   ← anywhere in the statement
+    //     '2026-06-02 00:00:01.001'             ← first value of a VALUES tuple
+    // The text is read as LOCAL time and scaled to `precision` (0=ms,1=us,2=ns).
+    std::string rewriteTimestampLiterals(const std::string& sql, uint8_t precision) const;
 
     // Display welcome banner
     void showBanner();
@@ -325,6 +340,9 @@ private:
     std::string    _currentDB;     // session state
     uint8_t        _precision = 0; // current db ts precision (0=ms, 1=us, 2=ns)
     int32_t        _currentdbId = 1;  // dbId for the current database (for query routing)
+    // db name → ts precision (SHOW DATABASES result cache; cleared on
+    // CREATE/DROP DATABASE so a recreated db is re-read)
+    std::unordered_map<std::string, uint8_t> _precCache;
 };
 
 // ============================================================================
@@ -804,10 +822,220 @@ inline EtDBShell::~EtDBShell() {
 
 // 查询 SHOW DATABASES 解析当前数据库的时间精度（0=ms, 1=us, 2=ns）
 // 库名比较大小写不敏感（shell 的 USE 解析结果是全大写）
+// ── Datetime literals (shell-only convenience) ─────────────────────────────
+// 'YYYY-MM-DD[ HH:MM:SS[.fff…]]' (also 'T' as the date/time separator, and a
+// date-only form) → epoch count in the table's precision (0=ms, 1=us, 2=ns).
+// Local time, matching the ts display, so insert → select round-trips.
+inline bool parseDatetimeToTs(const char* s, size_t n, uint8_t precision, int64_t& out) {
+    size_t i = 0;
+    while (i < n && isspace((unsigned char)s[i])) ++i;
+    if (n - i < 10) return false;                 // shortest form: YYYY-MM-DD
+
+    auto digits = [&](int want, int& val) -> bool {
+        if (i + (size_t)want > n) return false;
+        int v = 0;
+        for (int k = 0; k < want; ++k) {
+            const char c = s[i + (size_t)k];
+            if (c < '0' || c > '9') return false;
+            v = v * 10 + (c - '0');
+        }
+        i += (size_t)want;
+        val = v;
+        return true;
+    };
+
+    int year = 0, mon = 0, day = 0;
+    if (!digits(4, year)) return false;
+    if (i >= n || s[i] != '-') return false;  ++i;
+    if (!digits(2, mon))  return false;
+    if (i >= n || s[i] != '-') return false;  ++i;
+    if (!digits(2, day))  return false;
+
+    int hour = 0, min = 0, sec = 0;
+    long long fracNs = 0;
+    if (i < n && (s[i] == ' ' || s[i] == 'T' || s[i] == 't')) {
+        ++i;
+        while (i < n && isspace((unsigned char)s[i])) ++i;
+        if (!digits(2, hour)) return false;
+        if (i < n && s[i] == ':') {
+            ++i;
+            if (!digits(2, min)) return false;
+            if (i < n && s[i] == ':') {
+                ++i;
+                if (!digits(2, sec)) return false;
+                if (i < n && s[i] == '.') {           // fractional seconds
+                    ++i;
+                    int nd = 0;
+                    while (i < n && s[i] >= '0' && s[i] <= '9') {
+                        if (nd < 9) fracNs = fracNs * 10 + (s[i] - '0');
+                        ++nd;
+                        ++i;
+                    }
+                    if (nd == 0) return false;
+                    for (int k = nd; k < 9; ++k) fracNs *= 10;   // → nanoseconds
+                }
+            }
+        }
+    }
+    while (i < n && isspace((unsigned char)s[i])) ++i;
+    if (i != n) return false;                     // trailing junk
+    if (mon < 1 || mon > 12 || day < 1 || day > 31) return false;
+    if (hour > 23 || min > 59 || sec > 60) return false;
+
+    std::tm tmv;
+    memset(&tmv, 0, sizeof(tmv));
+    tmv.tm_year = year - 1900;
+    tmv.tm_mon  = mon - 1;
+    tmv.tm_mday = day;
+    tmv.tm_hour = hour;
+    tmv.tm_min  = min;
+    tmv.tm_sec  = sec;
+    tmv.tm_isdst = -1;                            // let libc resolve DST
+    const time_t secs = std::mktime(&tmv);
+    if (secs == (time_t)-1) return false;         // not representable
+
+    const int64_t ns = (int64_t)secs * 1000000000LL + fracNs;
+    switch (precision) {
+        case 2:  out = ns;              break;    // ns
+        case 1:  out = ns / 1000LL;     break;    // us
+        default: out = ns / 1000000LL;  break;    // ms
+    }
+    return true;
+}
+
+// One INSERT value token → raw ts number. Accepts
+//     timestamp '<datetime>'   timestamp <datetime>   '<datetime>'
+// and returns false for anything else.
+inline bool shellTsLiteralToNumber(const std::string& tokRaw, uint8_t prec, std::string& out) {
+    size_t a = 0, b = tokRaw.size();
+    while (a < b && isspace((unsigned char)tokRaw[a])) ++a;
+    while (b > a && isspace((unsigned char)tokRaw[b - 1])) --b;
+    const std::string t = tokRaw.substr(a, b - a);
+    if (t.empty()) return false;
+
+    size_t k = 0;
+    const bool hasKeyword = t.size() >= 9 && strncasecmp(t.c_str(), "timestamp", 9) == 0 &&
+                            (t.size() == 9 || isspace((unsigned char)t[9]));
+    if (hasKeyword) {
+        k = 9;
+        while (k < t.size() && isspace((unsigned char)t[k])) ++k;
+    } else if (t[0] != '\'' && t[0] != '"') {
+        return false;                             // bare text needs the keyword
+    }
+    if (k >= t.size()) return false;
+
+    std::string lit;
+    const char q = t[k];
+    if (q == '\'' || q == '"') {
+        if (t.size() < k + 2 || t.back() != q) return false;
+        lit = t.substr(k + 1, t.size() - k - 2);
+    } else {
+        lit = t.substr(k);
+    }
+    int64_t ts = 0;
+    if (!parseDatetimeToTs(lit.data(), lit.size(), prec, ts)) return false;
+    out = std::to_string(ts);
+    return true;
+}
+
+inline std::string EtDBShell::rewriteTimestampLiterals(const std::string& sql, uint8_t precision) const {
+    // Pass 1: `timestamp '<dt>'` (keyword form) anywhere outside quoted text.
+    std::string s1;
+    s1.reserve(sql.size() + 16);
+    {
+        size_t i = 0;
+        const size_t n = sql.size();
+        while (i < n) {
+            const char c = sql[i];
+            if (c == '\'' || c == '"') {                    // copy quoted text verbatim
+                s1 += c;
+                ++i;
+                while (i < n) { s1 += sql[i]; if (sql[i] == c) { ++i; break; } ++i; }
+                continue;
+            }
+            const bool boundary =
+                (i == 0) || !(isalnum((unsigned char)sql[i - 1]) || sql[i - 1] == '_');
+            if (boundary && i + 9 <= n && strncasecmp(sql.c_str() + i, "timestamp", 9) == 0 &&
+                (i + 9 == n || !(isalnum((unsigned char)sql[i + 9]) || sql[i + 9] == '_'))) {
+                size_t j = i + 9;
+                while (j < n && sql[j] != ',' && sql[j] != ')' && sql[j] != ';') ++j;
+                std::string num;
+                if (shellTsLiteralToNumber(sql.substr(i, j - i), precision, num)) {
+                    s1 += num;
+                    i = j;
+                    continue;
+                }
+            }
+            s1 += c;
+            ++i;
+        }
+    }
+
+    // Pass 2: a bare quoted datetime as the FIRST value of each VALUES tuple.
+    std::string s2;
+    s2.reserve(s1.size() + 16);
+    size_t i = 0;
+    const size_t n = s1.size();
+    bool inValues = false, firstValue = false;
+    while (i < n) {
+        const char c = s1[i];
+        if (c == '\'' || c == '"') {
+            size_t j = i + 1;
+            while (j < n && s1[j] != c) ++j;
+            const size_t vend = (j < n) ? j + 1 : n;
+            if (inValues && firstValue) {
+                std::string num;
+                if (shellTsLiteralToNumber(s1.substr(i, vend - i), precision, num)) {
+                    s2 += num;
+                    i = vend;
+                    firstValue = false;
+                    continue;
+                }
+            }
+            s2 += s1.substr(i, vend - i);
+            i = vend;
+            firstValue = false;
+            continue;
+        }
+        if (!inValues) {
+            if ((c == 'V' || c == 'v') && i + 6 <= n &&
+                strncasecmp(s1.c_str() + i, "VALUES", 6) == 0 &&
+                (i + 6 == n || !(isalnum((unsigned char)s1[i + 6]) || s1[i + 6] == '_'))) {
+                s2 += s1.substr(i, 6);
+                i += 6;
+                inValues = true;
+                continue;
+            }
+            s2 += c;
+            ++i;
+            continue;
+        }
+        if (c == '(') {
+            s2 += c;
+            ++i;
+            firstValue = true;
+            while (i < n && isspace((unsigned char)s1[i])) s2 += s1[i++];
+            continue;
+        }
+        if (c == ',' || c == ')') {
+            s2 += c;
+            ++i;
+            firstValue = false;
+            continue;
+        }
+        s2 += c;
+        ++i;
+    }
+    return s2;
+}
+
 inline uint8_t EtDBShell::lookupPrecision(const std::string& db) {
     if (db.empty()) return 0;
     std::string dbl = db;
     for (auto& c : dbl) c = (char)tolower((unsigned char)c);
+    auto cached = _precCache.find(dbl);
+    if (cached != _precCache.end()) return cached->second;
+    uint8_t prec = 0;                       // default: ms
     auto r = _client.query("SHOW DATABASES");
     for (int row = 0; row < r.rowCount(); ++row) {
         if (r.colCount() < 5) continue;
@@ -815,13 +1043,40 @@ inline uint8_t EtDBShell::lookupPrecision(const std::string& db) {
         std::string name(r.stringValue(row, 0));
         for (auto& c : name) c = (char)tolower((unsigned char)c);
         if (name == dbl) {
-            std::string_view prec = r.stringValue(row, 4);
-            if (prec == "ns") return 2;
-            if (prec == "us") return 1;
-            return 0;
+            std::string_view p = r.stringValue(row, 4);
+            if (p == "ns") prec = 2;
+            else if (p == "us") prec = 1;
+            else prec = 0;
+            break;
         }
     }
-    return 0;
+    _precCache[dbl] = prec;
+    return prec;
+}
+
+// 语句级时间戳精度：以「被查询表所属库」为准（FROM db.table / FROM table + 当前库），
+// 而不是会话当前库——跨库查询曾因此把 ms 数据渲染成 1970-。
+inline uint8_t EtDBShell::precisionForStatement(const std::string& sql) {
+    std::string db;
+    std::string up = sql;
+    for (auto& c : up) c = (char)toupper((unsigned char)c);
+    size_t f = up.find(" FROM ");
+    if (f != std::string::npos) {
+        size_t p = f + 6;
+        while (p < sql.size() && isspace((unsigned char)sql[p])) ++p;
+        std::string tgt;
+        while (p < sql.size() && !isspace((unsigned char)sql[p]) &&
+               sql[p] != ';' && sql[p] != ',' && sql[p] != ')') {
+            tgt += sql[p++];
+        }
+        auto dot = tgt.find('.');
+        if (dot != std::string::npos) db = tgt.substr(0, dot);
+        // Strip quotes from a quoted identifier ("db"."tbl")
+        if (!db.empty() && (db.front() == '"' || db.front() == '`')) db.erase(0, 1);
+    }
+    if (db.empty()) db = _currentDB;
+    if (db.empty()) return _precision;
+    return lookupPrecision(db);
 }
 
 inline bool EtDBShell::init() {
@@ -872,8 +1127,12 @@ inline void EtDBShell::showHelp() {
     printf("    DROP DATABASE <name>;\n");
     printf("    CREATE TABLE <name> (ts TIMESTAMP, col1 INT, col2 FLOAT);\n");
     printf("    DROP TABLE <name>;\n");
+    printf("    CREATE GROUP <name>;                -- named group of tables\n");
+    printf("    DROP GROUP <name>;\n");
+    printf("    CREATE TABLE <name> (ts TIMESTAMP, v INT) IN <group> TAGS (loc='A', model='T1');\n");
     printf("    SHOW DATABASES;\n");
     printf("    SHOW TABLES;\n");
+    printf("    SHOW GROUPS;\n");
     printf("    USE <db_name>;\n");
     printf("\n");
     printf("  DML Commands:\n");
@@ -881,7 +1140,9 @@ inline void EtDBShell::showHelp() {
     printf("    SELECT * FROM test WHERE temperature > 25.0;\n");
     printf("    SELECT COUNT(*), AVG(temperature) FROM test;\n");
     printf("    SELECT * FROM test ORDER BY temperature DESC LIMIT 5;\n");
+    printf("    SELECT ts,v FROM <group> WHERE loc='A';   -- group: list columns (no SELECT *)\n");
     printf("    INSERT INTO test VALUES(1716364800000, 25.5, 1013.2);\n");
+    printf("    INSERT INTO test VALUES(timestamp '2026-06-02 00:00:01.001', 25.5, 1013.2);\n");
     printf("\n");
 }
 
@@ -893,8 +1154,36 @@ inline std::string EtDBShell::nowStr() {
     return buf;
 }
 
-inline bool EtDBShell::executeSQL(const std::string& sql) {
-    if (sql.empty()) return true;
+inline bool EtDBShell::executeSQL(const std::string& sqlIn) {
+    if (sqlIn.empty()) return true;
+    std::string sql = sqlIn;
+
+    // ── Shell-only: datetime literals in INSERT ──
+    // `INSERT INTO t VALUES(timestamp '2026-06-02 00:00:01.001', 1)` — the text
+    // is rewritten into the raw integer the server expects, converted with the
+    // TARGET table's db precision. The SDK/API deliberately stays numeric-only.
+    {
+        std::string up = sql;
+        for (auto& c : up) c = (char)toupper((unsigned char)c);
+        size_t p = 0;
+        while (p < up.size() && isspace((unsigned char)up[p])) ++p;
+        if (up.compare(p, 6, "INSERT") == 0) {
+            // [db.]table after "INSERT INTO" → the db decides the unit
+            std::string db;
+            size_t t = up.find("INTO", p);
+            if (t != std::string::npos) {
+                size_t q = t + 4;
+                while (q < sql.size() && isspace((unsigned char)sql[q])) ++q;
+                std::string tbl;
+                while (q < sql.size() && !isspace((unsigned char)sql[q]) && sql[q] != '(')
+                    tbl += sql[q++];
+                auto dot = tbl.find('.');
+                if (dot != std::string::npos) db = tbl.substr(0, dot);
+            }
+            if (db.empty()) db = _currentDB;
+            sql = rewriteTimestampLiterals(sql, lookupPrecision(db));
+        }
+    }
 
     // ── Client-side SQL pre-validation ──
     // Perform basic syntax checks before sending to server.
@@ -1076,9 +1365,13 @@ inline bool EtDBShell::executeSQL(const std::string& sql) {
                 _formatter.printStatus("Query OK");
             else
                 _formatter.printStatus("Unknown database or syntax error.");
+            // CREATE/DROP DATABASE may change a db's precision: drop the cache
+            // so the next statement re-reads it from SHOW DATABASES.
+            if (startsWithKeyword(rest, "CREATE") || startsWithKeyword(rest, "DROP"))
+                _precCache.clear();
         }
     } else {
-        _formatter.print(result, _precision);
+        _formatter.print(result, precisionForStatement(sql));
         // Show total matching rows when auto-limited: only `limit` rows decoded,
         // the total comes from a fast COUNT(*) estimate (no full decode).
         if (!countSql.empty() && countTotal >= 0 && countTotal > result.rowCount()) {

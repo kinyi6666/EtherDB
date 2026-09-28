@@ -122,8 +122,8 @@ ETDB_CONN* etdb_connect(const char* host, uint16_t port,
     auto* conn = new EtDBConn_Impl();
     conn->client = new EtDBClient();
     conn->client->init();
-    conn->user = user ? user : "root";
-    conn->password = password ? password : "etherdbdata";
+    conn->user = user ? user : "";
+    conn->password = password ? password : "";
     conn->db = db ? db : "";
     if (!conn->client->connect(host, port, conn->user.c_str(),
                                 conn->password.c_str(), conn->db.c_str())) {

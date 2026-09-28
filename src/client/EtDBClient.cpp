@@ -22,6 +22,7 @@
  */
 
 #include "EtDBClient.h"
+#include "EtDBSha256.h"
 
 #include <cstdio>
 #include <cstring>
@@ -810,6 +811,11 @@ bool EtDBConnection::connect(const std::string& host, uint16_t port,
 
     _user = user ? user : "root";
     _password = password ? password : "etherdbdata";
+    // Empty strings mean "use the default account" (the CM_CONNECT challenge
+    // cannot authenticate an empty user, and call sites such as
+    // etdb_connect(host, port, "", "", db) rely on the documented default).
+    if (_user.empty())     _user = "root";
+    if (_password.empty()) _password = "etherdbdata";
     _db = db ? db : "";
 
     // 跨平台初始化（Windows 下 WSAStartup）
@@ -827,39 +833,69 @@ bool EtDBConnection::connect(const std::string& host, uint16_t port,
     }
 
     // === Authentication handshake: CM_CONNECT (msgType=49) ===
-    // Body format: user\0password\0
+    // Two phases — the clear-text password never travels the wire:
+    //   1) client: user \0 \0          (empty password field = challenge request)
+    //      server: code 0 + SConnectChallenge {nonce, salt}   (or -1: unknown user)
+    //   2) client: user \0 proof \0
+    //      proof = SHA256hex(nonce || SHA256hex(salt || password))
+    //      server: code 0 = authenticated / -1
+    // The nonce is fresh per login, so a captured proof cannot be replayed; the
+    // salt lets the client derive the same value the server stores as $salt$hash.
     {
-        int userLen = (int)_user.size();
-        int passLen = (int)_password.size();
-        int bodyLen = userLen + 1 + passLen + 1;  // user + \0 + password + \0
-        int totalLen = (int)sizeof(STxHead) + bodyLen;
+        auto sendAuthMsg = [&](const std::string& body) -> bool {
+            const int totalLen = (int)sizeof(STxHead) + (int)body.size();
+            std::vector<uint8_t> msg((size_t)totalLen, 0);
+            STxHead* head = (STxHead*)msg.data();
+            head->version = 0x01;
+            head->msgType = ETDB::Proto::MSG_CM_CONNECT; // CM_CONNECT=49
+            head->msgLen  = htonl(totalLen);
+            strncpy(head->user, _user.c_str(), ETDB_USER_LEN - 1);
+            memcpy(msg.data() + sizeof(STxHead), body.data(), body.size());
+            return TcpClient::sendAll(s, msg.data(), totalLen) == totalLen;
+        };
+        auto recvAuthMsg = [&](int& code, std::vector<uint8_t>& cont) -> bool {
+            STxHead rspHead;
+            memset(&rspHead, 0, sizeof(rspHead));
+            int n = TcpClient::recv(s, &rspHead, (int)sizeof(STxHead), MSG_WAITALL);
+            if (n != (int)sizeof(STxHead)) return false;
+            code = ntohl(rspHead.rtCode);
+            const int contLen = ntohl(rspHead.msgLen) - (int)sizeof(STxHead);
+            cont.clear();
+            if (contLen > 0) {
+                cont.resize((size_t)contLen);
+                if (TcpClient::recv(s, cont.data(), contLen, MSG_WAITALL) != contLen) return false;
+            }
+            return true;
+        };
 
-        std::vector<uint8_t> authMsg(totalLen, 0);
-        STxHead* head = (STxHead*)authMsg.data();
-        head->version = 0x01;
-        head->msgType = ETDB::Proto::MSG_CM_CONNECT; // CM_CONNECT=49
-        head->msgLen  = htonl(totalLen);
-        strncpy(head->user, _user.c_str(), ETDB_USER_LEN - 1);
+        // ── Phase 1: challenge ──
+        std::string body = _user;
+        body += '\0';
+        body += '\0';
+        int rspCode = -1;
+        std::vector<uint8_t> cont;
+        if (!sendAuthMsg(body) || !recvAuthMsg(rspCode, cont) || rspCode != 0 ||
+            cont.size() < sizeof(ETDB::SConnectChallenge)) {
+            fprintf(stderr, "ERROR: Authentication failed for user '%s' (challenge, code:%d)\n",
+                    _user.c_str(), rspCode);
+            TcpClient::close(s);
+            _sock = INVALID_TCP_SOCKET;
+            return false;
+        }
+        const ETDB::SConnectChallenge* ch = (const ETDB::SConnectChallenge*)cont.data();
+        int saltLen = (int)ch->saltLen;
+        if (saltLen < 0 || saltLen > (int)sizeof(ch->salt)) saltLen = 0;
+        const std::string salt(ch->salt, (size_t)saltLen);
+        const std::string nonce((const char*)ch->nonce, ETDB::ETDB_AUTH_NONCE_LEN);
 
-        char* body = (char*)authMsg.data() + sizeof(STxHead);
-        memcpy(body, _user.c_str(), userLen);
-        body[userLen] = '\0';
-        memcpy(body + userLen + 1, _password.c_str(), passLen);
-        body[userLen + 1 + passLen] = '\0';  // null-terminate password
-
-        // Send
-        int sent = TcpClient::sendAll(s, authMsg.data(), totalLen);
-        if (sent != totalLen) { TcpClient::close(s); _sock = INVALID_TCP_SOCKET; return false; }
-
-        // Receive response
-        STxHead rspHead;
-        memset(&rspHead, 0, sizeof(rspHead));
-        int n = TcpClient::recv(s, &rspHead, (int)sizeof(STxHead), MSG_WAITALL);
-        if (n != (int)sizeof(STxHead)) { TcpClient::close(s); _sock = INVALID_TCP_SOCKET; return false; }
-
-        int rspCode = ntohl(rspHead.rtCode);
-        if (rspCode != 0) {
-            // Auth failed — server returned error code
+        // ── Phase 2: proof ──
+        const std::string stored = MsgSha256::hex(salt + _password);   // = server $salt$hash
+        const std::string proof  = MsgSha256::hex(nonce + stored);
+        body = _user;
+        body += '\0';
+        body += proof;
+        body += '\0';
+        if (!sendAuthMsg(body) || !recvAuthMsg(rspCode, cont) || rspCode != 0) {
             fprintf(stderr, "ERROR: Authentication failed for user '%s' (code:%d)\n",
                     _user.c_str(), rspCode);
             TcpClient::close(s);
@@ -1316,6 +1352,9 @@ inline uint64_t fastAtou64(const char* s, size_t len) {
 
 // Timestamp column: keeps the historical guard — only [0-9-] is accepted in the
 // whole token (anything else yields 0) — then parses like strtoll.
+// Datetime literals (timestamp '2026-06-02 00:00:01.001') are a *shell* feature:
+// the shell rewrites them into raw numbers before calling this API, so the wire
+// protocol only ever carries integers.
 inline int64_t fastTsParse(const char* s, size_t len) {
     for (size_t i = 0; i < len; ++i) {
         const char c = s[i];
@@ -1501,8 +1540,9 @@ inline char scanInsertValue(const char* s, size_t n, size_t& p,
 }
 
 // Serialize one INSERT value span into slot `dst` (cb bytes) for column type
-// ct. Column 0 is always the timestamp (8 bytes, big-endian). Uses the fast
-// span converters above; scratch is only touched by rare libc float fallbacks.
+// ct. Column 0 is always the timestamp (8 bytes, big-endian, numeric only —
+// see fastTsParse). Uses the fast span converters above; scratch is only touched
+// by rare libc float fallbacks.
 inline void storeInsertValue(int vi, ColType ct, const char* vp, size_t vl,
                              uint8_t* dst, int cb, std::string& scratch) {
     if (vi == 0) {
@@ -1698,6 +1738,7 @@ EtDBResult EtDBConnection::query(const std::string& sql, int dbId,
         const int nMetaCols = (int)colSizeBuf.size();
         const int* colSizeP = colSizeBuf.data();
         const ColType* colTypeP = colTypeBuf.data();
+        // (datetime literals are rewritten into raw numbers by the shell client)
 
         // Find the VALUES row groups: (v1,v2,...) (v3,v4,...) ...
         while (p < sql.size() && sql[p] != '(') ++p;
@@ -1820,6 +1861,12 @@ EtDBResult EtDBConnection::query(const std::string& sql, int dbId,
         else if (upper.find("CREATE TABLE", pp) == pp || upper.find("CREATE STABLE", pp) == pp)
             msgType = Proto::MSG_CM_CREATE_TABLE;
         else if (upper.find("DROP TABLE", pp) == pp || upper.find("DROP STABLE", pp) == pp)
+            msgType = Proto::MSG_CM_DROP_TABLE;
+        // Groups (tag.txt): MNode dispatches on the SQL text, so the generic
+        // table DDL message types are reused.
+        else if (upper.find("CREATE GROUP", pp) == pp)
+            msgType = Proto::MSG_CM_CREATE_TABLE;
+        else if (upper.find("DROP GROUP", pp) == pp)
             msgType = Proto::MSG_CM_DROP_TABLE;
         else if (upper.find("ALTER ", pp) == pp)
             msgType = Proto::MSG_CM_ALTER_TABLE;
