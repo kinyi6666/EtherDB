@@ -399,8 +399,8 @@ private:
     int _lastdbId = 1;  // dbId of the most recent query (for FETCH routing)
     int _currentdbId = 1;  // dbId of the current USE database (routing)
     std::unordered_map<std::string, uint64_t> _tableUidCache;
-    std::string _user = "root";
-    std::string _password = "etherdbdata";
+    std::string _user = "";
+    std::string _password = "";
     std::string _db;
 
     // ── Async insert state ──

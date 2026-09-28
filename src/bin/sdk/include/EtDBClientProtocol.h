@@ -84,6 +84,31 @@ inline bool    isReq(uint8_t t)     { return (t & 1) != 0; }
 constexpr int ETDB_USER_LEN = 32;
 
 // ============================================================================
+// CM_CONNECT handshake — the password never travels in clear text
+// ============================================================================
+// Phase 1 (challenge request):
+//     client -> user \0 \0                     (empty password field)
+//     server -> code 0 + SConnectChallenge      (fresh nonce + the user's salt)
+//           or  code -1 when the user is unknown (same reply as a bad password,
+//               so accounts cannot be enumerated)
+// Phase 2 (proof):
+//     client -> user \0 proof \0
+//         proof = SHA256hex(nonce bytes || SHA256hex(salt || password))
+//               = SHA256hex(nonce || storedHash)   (the server re-computes it
+//                                                 from the persisted $salt$hash)
+//     server -> code 0 (session authenticated) / -1
+// The nonce makes the proof single-use (a captured proof cannot be replayed),
+// and the clear-text password never leaves the client. The username is an
+// identifier (it is also carried in STxHead of every message) and stays plain.
+constexpr int ETDB_AUTH_NONCE_LEN = 16;
+
+struct SConnectChallenge {
+    uint8_t nonce[ETDB_AUTH_NONCE_LEN];
+    uint8_t saltLen;                 // length of the hex salt below
+    char    salt[64];
+};
+
+// ============================================================================
 // 列类型
 // ============================================================================
 enum class ColType : int8_t {
