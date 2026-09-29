@@ -316,6 +316,16 @@ private:
     // session's current db — a cross-db query used to render ms data as 1970-.
     uint8_t precisionForStatement(const std::string& sql);
 
+    // Group names of one database (cached; fetched with SHOW GROUPS FROM <db>).
+    // Cleared on CREATE/DROP so a new group is seen at once.
+    const std::vector<std::string>& lookupGroups(const std::string& db);
+
+    // True when the FROM target of the statement is a GROUP: the shell must NOT
+    // send its COUNT(*) helper for groups — a group's rows come from the
+    // members that carry the selected columns, so COUNT(*) (the sum over ALL
+    // members) would be a misleading "total" on the auto-LIMIT line.
+    bool fromTargetIsGroup(const std::string& sql);
+
     // Shell-only convenience for INSERT: rewrite datetime literals into the raw
     // integers the protocol expects (the SDK/API stays numeric-only):
     //     timestamp '2026-06-02 00:00:01.001'   ← anywhere in the statement
@@ -343,6 +353,9 @@ private:
     // db name → ts precision (SHOW DATABASES result cache; cleared on
     // CREATE/DROP DATABASE so a recreated db is re-read)
     std::unordered_map<std::string, uint8_t> _precCache;
+    // db name → group names (SHOW GROUPS FROM <db>; cleared on CREATE/DROP
+    // statements so CREATE/DROP GROUP is picked up immediately)
+    std::unordered_map<std::string, std::vector<std::string>> _groupCache;
 };
 
 // ============================================================================
@@ -1079,6 +1092,50 @@ inline uint8_t EtDBShell::precisionForStatement(const std::string& sql) {
     return lookupPrecision(db);
 }
 
+inline const std::vector<std::string>& EtDBShell::lookupGroups(const std::string& db) {
+    static const std::vector<std::string> kEmpty;
+    if (db.empty()) return kEmpty;
+    auto it = _groupCache.find(db);
+    if (it != _groupCache.end()) return it->second;
+    std::vector<std::string> names;
+    auto r = _client.query("SHOW GROUPS FROM " + db);
+    if (r.success() && r.colCount() >= 1) {
+        for (int row = 0; row < r.rowCount(); ++row)
+            names.emplace_back(r.stringValue(row, 0));
+    }
+    // Cache even an empty/failed result: the next CREATE/DROP clears it.
+    auto ins = _groupCache.emplace(db, std::move(names));
+    return ins.first->second;
+}
+
+inline bool EtDBShell::fromTargetIsGroup(const std::string& sql) {
+    std::string up = sql;
+    for (auto& c : up) c = (char)toupper((unsigned char)c);
+    size_t f = up.find(" FROM ");
+    if (f == std::string::npos) return false;
+    size_t p = f + 6;
+    while (p < sql.size() && isspace((unsigned char)sql[p])) ++p;
+    std::string tgt;
+    while (p < sql.size() && !isspace((unsigned char)sql[p]) &&
+           sql[p] != ';' && sql[p] != ',' && sql[p] != ')') {
+        tgt += sql[p++];
+    }
+    if (tgt.empty()) return false;
+    std::string db, name = tgt;
+    auto dot = tgt.find('.');
+    if (dot != std::string::npos) { db = tgt.substr(0, dot); name = tgt.substr(dot + 1); }
+    // db name: lower-cased like the rest of the shell (server stores lowercase)
+    for (auto& c : db) c = (char)tolower((unsigned char)c);
+    if (!db.empty() && (db.front() == '"' || db.front() == '`')) db.erase(0, 1);
+    if (db.empty()) db = _currentDB;
+    for (auto& c : db) c = (char)tolower((unsigned char)c);
+    if (db.empty()) return false;
+    // Group names are case-sensitive (as stored) → exact compare.
+    for (const auto& g : lookupGroups(db))
+        if (g == name) return true;
+    return false;
+}
+
 inline bool EtDBShell::init() {
     printf("Connecting to %s:%d as %s...\n",
            _config.host.c_str(), _config.port, _config.user.c_str());
@@ -1141,6 +1198,8 @@ inline void EtDBShell::showHelp() {
     printf("    SELECT COUNT(*), AVG(temperature) FROM test;\n");
     printf("    SELECT * FROM test ORDER BY temperature DESC LIMIT 5;\n");
     printf("    SELECT ts,v FROM <group> WHERE loc='A';   -- group: list columns (no SELECT *)\n");
+    printf("    SELECT COUNT(v), SUM(v) FROM <group>;    -- group: per-column aggregate (members\n");
+    printf("                                             -- that have the column are merged)\n");
     printf("    INSERT INTO test VALUES(1716364800000, 25.5, 1013.2);\n");
     printf("    INSERT INTO test VALUES(timestamp '2026-06-02 00:00:01.001', 25.5, 1013.2);\n");
     printf("\n");
@@ -1277,10 +1336,15 @@ inline bool EtDBShell::executeSQL(const std::string& sqlIn) {
                       || (upper.find("MAX(")   != std::string::npos);
             if (!isAgg && upper.find("LIMIT ") == std::string::npos) {
                 effectiveSql = sql + " LIMIT 100";
-                // Build "SELECT COUNT(*) FROM <rest>" — keep WHERE/ORDER clauses
-                size_t fromIdx = upper.find(" FROM ", p + 7);
-                if (fromIdx != std::string::npos) {
-                    countSql = "SELECT COUNT(*) " + sql.substr(fromIdx + 1);
+                // Build "SELECT COUNT(*) FROM <rest>" — keep WHERE/ORDER clauses.
+                // NOT for a GROUP target: group rows come from the members that
+                // carry the selected columns, so COUNT(*) (the sum over ALL
+                // members) would be a misleading "total" — skip it entirely.
+                if (!fromTargetIsGroup(sql)) {
+                    size_t fromIdx = upper.find(" FROM ", p + 7);
+                    if (fromIdx != std::string::npos) {
+                        countSql = "SELECT COUNT(*) " + sql.substr(fromIdx + 1);
+                    }
                 }
             }
         }
@@ -1367,8 +1431,11 @@ inline bool EtDBShell::executeSQL(const std::string& sqlIn) {
                 _formatter.printStatus("Unknown database or syntax error.");
             // CREATE/DROP DATABASE may change a db's precision: drop the cache
             // so the next statement re-reads it from SHOW DATABASES.
-            if (startsWithKeyword(rest, "CREATE") || startsWithKeyword(rest, "DROP"))
+            // CREATE/DROP GROUP likewise invalidates the group-name cache.
+            if (startsWithKeyword(rest, "CREATE") || startsWithKeyword(rest, "DROP")) {
                 _precCache.clear();
+                _groupCache.clear();
+            }
         }
     } else {
         _formatter.print(result, precisionForStatement(sql));

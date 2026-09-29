@@ -7,8 +7,15 @@
  * unsupported forms (tag under OR, ORDER BY over a group), SHOW GROUPS,
  * SHOW TABLES (group column), DESCRIBE (TAG rows), restart persistence.
  *
+ * Heterogeneous members (tag.txt design item 1/2): the scanned member set is
+ * chosen by COLUMN presence (a member is skipped when a referenced column is
+ * missing), same-named columns must agree in type — enforced at CREATE TABLE
+ * time (-26) and re-checked defensively at query time. Group AGGREGATION runs
+ * the ordinary per-table aggregation on every member and merges the results
+ * (COUNT → Σ, SUM → Σ, MIN/MAX → min/max, AVG → Σsum/Σcount).
+ *
  * Usage: tag_group_test[.exe] <port> [verify]
- *   (no 2nd arg)  DROP/CREATE the database, insert 35 rows, run all checks
+ *   (no 2nd arg)  DROP/CREATE the database, insert rows, run all checks
  *   verify        only run the checks (used after a server restart)
  */
 #include <client/EtDBClient.h>
@@ -37,6 +44,11 @@ static const char* DB = "tagdb";
 static const int64_t BASE_A = 1700000000000LL;
 static const int64_t BASE_B = 1700001000000LL;
 static const int64_t BASE_C = 1700002000000LL;
+// Heterogeneous group g2 (tag.txt item 1):
+//   h_a(ts,it1,it2) 3 rows -> it1 1..3,   it2 10..12
+//   h_b(ts,it1,it2) 2 rows -> it1 4..5,   it2 13..14
+//   h_c(ts,it1,it3) 4 rows -> it1 6..9,   it3 100..103
+static const int64_t BASE_H = 1700100000000LL;
 
 // Insert `n` rows (ts = base + i*1000, v = v0 + i) into `table`.
 static int insertRows(EtDBClient& c, const std::string& table, int64_t base, int32_t v0, int n) {
@@ -52,6 +64,33 @@ static int insertRows(EtDBClient& c, const std::string& table, int64_t base, int
         bp[0].type = EtDBStmt::TYPE_TIMESTAMP; bp[0].buffer = &ts; bp[0].length = 8;
         bp[1].type = EtDBStmt::TYPE_INT;       bp[1].buffer = &v;  bp[1].length = 4;
         if (!stmt->bindParam(bp, 2) || !stmt->addBatch()) {
+            printf("  [FAIL] bind %s row %d\n", table.c_str(), i);
+            stmt->close();
+            return -1;
+        }
+    }
+    int aff = stmt->execute();
+    stmt->close();
+    return aff;
+}
+
+// Insert `n` rows (ts = base + i*1000, x = x0 + i, y = y0 + i) into `table`.
+static int insertRows2(EtDBClient& c, const std::string& table, int64_t base,
+                       int32_t x0, int32_t y0, int n) {
+    auto* stmt = c.createStmt();
+    if (!stmt->prepare("INSERT INTO " + table + " VALUES(?,?,?)")) {
+        printf("  [FAIL] prepare INSERT %s\n", table.c_str());
+        return -1;
+    }
+    for (int i = 0; i < n; ++i) {
+        int64_t ts = base + (int64_t)i * 1000;
+        int32_t x  = x0 + i;
+        int32_t y  = y0 + i;
+        EtDBStmt::BindParam bp[3];
+        bp[0].type = EtDBStmt::TYPE_TIMESTAMP; bp[0].buffer = &ts; bp[0].length = 8;
+        bp[1].type = EtDBStmt::TYPE_INT;       bp[1].buffer = &x;  bp[1].length = 4;
+        bp[2].type = EtDBStmt::TYPE_INT;       bp[2].buffer = &y;  bp[2].length = 4;
+        if (!stmt->bindParam(bp, 3) || !stmt->addBatch()) {
             printf("  [FAIL] bind %s row %d\n", table.c_str(), i);
             stmt->close();
             return -1;
@@ -208,12 +247,12 @@ static int runChecks(EtDBClient& c) {
               "computed column, unknown tag -> 0 rows with 1 column");
     }
 
-    // 8c. A group member with a DIFFERENT schema is skipped (logged), the rest
-    //     of the group keeps working.
+    // 8c. A group member that lacks the selected column is not scanned (the
+    //     rest of the group keeps working).
     {
         c.query("CREATE TABLE t_x (ts TIMESTAMP, w DOUBLE) IN g1 TAGS (location='A')");
         auto r = c.query("SELECT ts,v FROM g1 WHERE location='A'");
-        CHECKR(r.rowCount() == 15, "group scan skips the mismatched member t_x", r);
+        CHECKR(r.rowCount() == 15, "group scan skips the member without column v (t_x)", r);
     }
 
     // 9. Tag filter on a single table (no group): matching and non-matching.
@@ -280,6 +319,65 @@ static int runChecks(EtDBClient& c) {
         CHECK(locOk, "DESCRIBE t_a shows location='A'");
     }
 
+    // 15. Heterogeneous members: the scanned member set is chosen by COLUMN
+    //     presence — it1 exists in all three, it2 only in h_a/h_b, it3 only in h_c.
+    {
+        auto r = c.query("SELECT it1 FROM g2");
+        CHECKR(r.rowCount() == 9, "g2: SELECT it1 -> 9 rows (all members)", r);
+        CHECK(r.colCount() == 1, "g2: SELECT it1 -> 1 column");
+        auto r2 = c.query("SELECT it1, it2 FROM g2");
+        CHECKR(r2.rowCount() == 5, "g2: SELECT it1, it2 -> 5 rows (h_a+h_b)", r2);
+        auto r3 = c.query("SELECT it3 FROM g2");
+        CHECKR(r3.rowCount() == 4, "g2: SELECT it3 -> 4 rows (h_c only)", r3);
+        CHECK(r3.rowCount() == 4 && r3.get(0, 0).iVal == 100 && r3.get(3, 0).iVal == 103,
+              "g2: SELECT it3 values 100..103");
+        auto r4 = c.query("SELECT it1+100 FROM g2");          // computed → value path
+        CHECKR(r4.rowCount() == 9, "g2: computed column -> 9 rows", r4);
+        auto r5 = c.query("SELECT it9 FROM g2");              // no member has it9
+        CHECK(r5.error().empty() && r5.rowCount() == 0 && r5.colCount() == 1,
+              "g2: column no member has -> 0 rows, 1 column");
+        auto r6 = c.query("SELECT it1, it2 FROM g2 WHERE kind='c'");
+        CHECKR(r6.rowCount() == 0, "g2: it1,it2 with tag kind='c' -> 0 rows (no column)", r6);
+    }
+
+    // 16. Group aggregation = per-member aggregation + merge:
+    //     COUNT → Σ, SUM → Σ, MIN/MAX → min/max, AVG → Σsum/Σcount,
+    //     COUNT(*) → all members; column aggregates → members with the column.
+    {
+        auto r = c.query("SELECT count(it1) FROM g2");
+        CHECK(r.rowCount() == 1 && r.get(0, 0).iVal == 9, "g2 agg: count(it1) = 9");
+        auto r2 = c.query("SELECT count(it2) FROM g2");
+        CHECK(r2.rowCount() == 1 && r2.get(0, 0).iVal == 5, "g2 agg: count(it2) = 5 (h_a+h_b)");
+        auto r3 = c.query("SELECT count(it3) FROM g2");
+        CHECK(r3.rowCount() == 1 && r3.get(0, 0).iVal == 4, "g2 agg: count(it3) = 4 (h_c)");
+        auto r4 = c.query("SELECT count(*) FROM g2");
+        CHECK(r4.rowCount() == 1 && r4.get(0, 0).iVal == 9, "g2 agg: count(*) = 9 (all members)");
+        auto r5 = c.query("SELECT sum(it2) FROM g2");
+        CHECK(r5.rowCount() == 1 && numVal(r5, 0, 0) == 60.0, "g2 agg: sum(it2) = 60");
+        auto r6 = c.query("SELECT min(it3), max(it3) FROM g2");
+        CHECK(r6.rowCount() == 1 && numVal(r6, 0, 0) == 100.0 && numVal(r6, 0, 1) == 103.0,
+              "g2 agg: min(it3), max(it3) = 100, 103");
+        // avg-of-avgs would be 12.25 → the merged Σsum/Σcount must be exactly 12.0
+        auto r7 = c.query("SELECT avg(it2) FROM g2");
+        CHECK(r7.rowCount() == 1 && numVal(r7, 0, 0) > 11.99 && numVal(r7, 0, 0) < 12.01,
+              "g2 agg: avg(it2) = 12.0 (merged, not avg-of-avgs)");
+        auto r8 = c.query("SELECT count(it2), sum(it2) FROM g2");
+        CHECK(r8.rowCount() == 1 && r8.get(0, 0).iVal == 5 && numVal(r8, 0, 1) == 60.0,
+              "g2 agg: two aggregates in one statement");
+        auto r9 = c.query("SELECT count(it2) FROM g2 WHERE kind='a'");
+        CHECK(r9.rowCount() == 1 && r9.get(0, 0).iVal == 3, "g2 agg: count(it2) WHERE kind='a' = 3");
+        auto r10 = c.query("SELECT count(it2) FROM g2 WHERE kind='c'");
+        CHECK(r10.rowCount() == 1 && r10.get(0, 0).iVal == 0,
+              "g2 agg: count(it2) WHERE kind='c' = 0 (member lacks it2)");
+        auto r11 = c.query("SELECT count(it1) FROM g2 WHERE ts >= " + std::to_string(BASE_H + 2000000));
+        CHECK(r11.rowCount() == 1 && r11.get(0, 0).iVal == 4, "g2 agg: count(it1) with ts range = 4");
+        // Unsupported over a group: mixed select list / GROUP BY.
+        auto r12 = c.query("SELECT it2, count(it2) FROM g2");
+        CHECK(!r12.error().empty(), "g2 agg: mixed column+aggregate -> error reported");
+        auto r13 = c.query("SELECT count(it2) FROM g2 GROUP BY it2");
+        CHECK(!r13.error().empty(), "g2 agg: GROUP BY over a group -> error reported");
+    }
+
     return g_fail;
 }
 
@@ -321,6 +419,31 @@ int main(int argc, char* argv[]) {
         CHECK(insertRows(c, "t_a", BASE_A, 100, 10) == 10, "insert 10 rows into t_a");
         CHECK(insertRows(c, "t_b", BASE_B, 200, 20) == 20, "insert 20 rows into t_b");
         CHECK(insertRows(c, "t_c", BASE_C, 300, 5)  == 5,  "insert 5 rows into t_c");
+
+        // ── g2: HETEROGENEOUS members (tag.txt item 1/2) ──
+        // Members may differ in layout; the member set of a query is chosen by
+        // COLUMN presence (it2 only in h_a/h_b, it3 only in h_c), and the same
+        // column name must agree in type (checked at CREATE TABLE time).
+        auto g2n = c.query("CREATE GROUP g2");
+        CHECK(g2n.error().empty(), "CREATE GROUP g2");
+        auto h1 = c.query("CREATE TABLE h_a (ts TIMESTAMP, it1 INT, it2 INT) IN g2 TAGS (kind='a')");
+        auto h2 = c.query("CREATE TABLE h_b (ts TIMESTAMP, it1 INT, it2 INT) IN g2 TAGS (kind='b')");
+        auto h3 = c.query("CREATE TABLE h_c (ts TIMESTAMP, it1 INT, it3 INT) IN g2 TAGS (kind='c')");
+        CHECK(h1.error().empty() && h2.error().empty() && h3.error().empty(),
+              "CREATE TABLE heterogeneous members IN g2");
+        // Same-named column with a different type/width → DDL rejected.
+        auto bad1 = c.query("CREATE TABLE h_bad (ts TIMESTAMP, it1 BIGINT) IN g2");
+        CHECK(!bad1.error().empty(), "member re-typing it1 (BIGINT vs INT) -> rejected");
+        auto bad2 = c.query("CREATE TABLE h_bad2 (ts TIMESTAMP, it2 DOUBLE) IN g2");
+        CHECK(!bad2.error().empty(), "member re-typing it2 (DOUBLE vs INT) -> rejected");
+        // A member may introduce columns nobody else has (no conflict).
+        auto h4 = c.query("CREATE TABLE h_d (ts TIMESTAMP, it1 INT, it9 INT) IN g2");
+        CHECK(h4.error().empty(), "member may add its own columns");
+        c.query("DROP TABLE h_d");
+
+        CHECK(insertRows2(c, "h_a", BASE_H,             1, 10, 3) == 3, "insert 3 rows into h_a");
+        CHECK(insertRows2(c, "h_b", BASE_H + 1000000,   4, 13, 2) == 2, "insert 2 rows into h_b");
+        CHECK(insertRows2(c, "h_c", BASE_H + 2000000,   6, 100, 4) == 4, "insert 4 rows into h_c");
     }
 
     runChecks(c);
